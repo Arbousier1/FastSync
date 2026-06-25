@@ -300,8 +300,39 @@ val copyRuntimeLibs = tasks.register<Copy>("copyRuntimeLibs") {
     }
 }
 
+// =============================================================================
+// Fat JAR: bundles runtime dependencies (Paper does not load Class-Path libs)
+// =============================================================================
+// Paper's plugin remapper ignores the Class-Path manifest, so the lib/ folder
+// pattern used above does not work at runtime. For environments that need a
+// single deployable artifact, this task produces a fat jar with all runtime
+// dependencies embedded (no relocation / no shade).
+// =============================================================================
+val fatJar = tasks.register<Jar>("fatJar") {
+    group = "build"
+    description = "Packages a standalone Paper/Folia plugin JAR with all runtime dependencies embedded (no shade)."
+    archiveBaseName.set("FastSync-All")
+    archiveVersion.set(version.toString())
+    from(sourceSets["main"].output)
+    from({
+        configurations.runtimeClasspath.get().map { f ->
+            if (f.isDirectory) f else zipTree(f)
+        }
+    })
+    exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA",
+            "META-INF/maven/**", "META-INF/LICENSE*", "META-INF/NOTICE*")
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    manifest {
+        attributes(
+            "Implementation-Title" to "FastSync",
+            "Implementation-Version" to project.version.toString(),
+            "Multi-Release" to "true"
+        )
+    }
+}
+
 tasks.named("assemble") {
-    dependsOn(velocityJar, copyRuntimeLibs)
+    dependsOn(velocityJar, copyRuntimeLibs, fatJar)
 }
 
 tasks.named("check") {

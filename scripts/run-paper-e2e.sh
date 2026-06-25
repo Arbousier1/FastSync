@@ -26,29 +26,24 @@ echo "[1/5] Building FastSync plugin..."
 ./gradlew build --no-daemon -x test
 
 MAIN_JAR="FastSync-1.0.0.jar"
+FAT_JAR="FastSync-All-1.0.0.jar"
 PROXY_JAR="FastSync-Proxy-1.0.0.jar"
 
-if [[ ! -f "build/libs/${MAIN_JAR}" ]]; then
-    echo "ERROR: build/libs/${MAIN_JAR} not found"
+if [[ ! -f "build/libs/${FAT_JAR}" ]]; then
+    echo "ERROR: build/libs/${FAT_JAR} not found"
     exit 1
 fi
 
 echo "[2/5] Preparing e2e/plugins directory..."
 rm -rf "${PLUGINS_DIR}"
-mkdir -p "${PLUGINS_DIR}/lib"
+mkdir -p "${PLUGINS_DIR}"
 
-cp "build/libs/${MAIN_JAR}" "${PLUGINS_DIR}/"
-
-# Copy all runtime dependencies (everything except the two FastSync JARs)
-for jar in build/libs/*.jar; do
-    name="$(basename "${jar}")"
-    if [[ "${name}" != "${MAIN_JAR}" && "${name}" != "${PROXY_JAR}" ]]; then
-        cp "${jar}" "${PLUGINS_DIR}/lib/"
-    fi
-done
+# Paper's plugin remapper ignores the Class-Path manifest, so the lib/ folder
+# distribution does not work at runtime. Use the fat jar (no shade / no
+# relocation) for E2E testing.
+cp "build/libs/${FAT_JAR}" "${PLUGINS_DIR}/${MAIN_JAR}"
 
 echo "Plugin: ${PLUGINS_DIR}/${MAIN_JAR}"
-echo "Runtime libs: $(ls -1 "${PLUGINS_DIR}/lib" | wc -l) jar(s)"
 
 # The itzg/minecraft-server container runs as uid 1000 and needs write access
 # to /data/plugins so Paper can create its .paper-remapped cache.
