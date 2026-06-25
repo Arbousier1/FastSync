@@ -1,0 +1,109 @@
+# =============================================================================
+# FastSync Paper E2E 测试环境
+# =============================================================================
+#
+# 启动两套真实的 Paper 1.21.4 服务器，共享同一个 MySQL 和 Redis，
+# 用于验证 FastSync 的跨服玩家数据同步。
+#
+# 使用方法：
+#   ./scripts/run-paper-e2e.sh
+#
+# 服务：
+#   - mysql:   MySQL 8.4 (fastsync 数据库)
+#   - redis:   Redis 7 (锁协调)
+#   - paper-a: Paper 1.21.4 服务器 A (游戏端口 25565, RCON 25575)
+#   - paper-b: Paper 1.21.4 服务器 B (游戏端口 25566, RCON 25576)
+# =============================================================================
+
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: fastsync-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: fastsync
+      MYSQL_USER: fastsync
+      MYSQL_PASSWORD: fastsync
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - mysql-data:/var/lib/mysql
+
+  redis:
+    image: redis:7-alpine
+    container_name: fastsync-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  paper-a:
+    image: itzg/minecraft-server
+    container_name: fastsync-paper-a
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      EULA: "TRUE"
+      TYPE: "PAPER"
+      VERSION: "1.21.4"
+      SERVER_NAME: "paper-a"
+      RCON_PASSWORD: "fastsync-test"
+      RCON_PORT: "25575"
+      ENABLE_RCON: "true"
+      ONLINE_MODE: "false"
+      MAX_PLAYERS: "10"
+      MOTD: "FastSync Test Server A"
+      OPS: ""
+    ports:
+      - "25565:25565"
+      - "25575:25575"
+    volumes:
+      - ./e2e/plugins:/data/plugins:ro
+      - paper-a-data:/data
+    stdin_open: true
+    tty: true
+
+  paper-b:
+    image: itzg/minecraft-server
+    container_name: fastsync-paper-b
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      EULA: "TRUE"
+      TYPE: "PAPER"
+      VERSION: "1.21.4"
+      SERVER_NAME: "paper-b"
+      RCON_PASSWORD: "fastsync-test"
+      RCON_PORT: "25576"
+      ENABLE_RCON: "true"
+      ONLINE_MODE: "false"
+      MAX_PLAYERS: "10"
+      MOTD: "FastSync Test Server B"
+      OPS: ""
+    ports:
+      - "25566:25565"
+      - "25576:25576"
+    volumes:
+      - ./e2e/plugins:/data/plugins:ro
+      - paper-b-data:/data
+    stdin_open: true
+    tty: true
+
+volumes:
+  mysql-data:
+  paper-a-data:
+  paper-b-data:

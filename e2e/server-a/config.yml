@@ -1,0 +1,91 @@
+# FastSync E2E test config for paper-a
+server-name: "paper-a"
+
+database:
+  type: "mysql"
+  host: "mysql"
+  port: 3306
+  database: "fastsync"
+  username: "fastsync"
+  password: "fastsync"
+  table-prefix: "fastsync_"
+  pool-size: 10
+  connection-timeout: 10000
+  idle-timeout: 300000
+  max-lifetime: 1800000
+  leak-detection-threshold: 60000
+  parameters: "useSSL=false&useUnicode=true&characterEncoding=UTF-8&autoReconnect=true"
+
+redis:
+  enabled: true
+  host: "redis"
+  port: 6379
+  password: ""
+  database: 0
+  ssl: false
+  timeout: 5000
+  channel-prefix: "fastsync:lock:"
+  cache-enabled: false
+  streams-enabled: true
+
+sync:
+  sync-inventory: true
+  sync-ender-chest: true
+  sync-health: true
+  sync-food: true
+  sync-experience: true
+  sync-potion-effects: true
+  sync-game-mode: true
+  sync-fire-ticks: true
+  sync-air: true
+  sync-extra-data: true
+  sync-advancements: true
+  sync-statistics: true
+  sync-attributes: true
+  sync-flight: true
+  sync-pdc: true
+  sync-location: false
+  sync-locked-maps: true
+
+  lock-timeout: 30
+  lock-retry-interval-ms: 1000
+  lock-max-retries: 30
+  save-delay: 0
+  clear-before-apply: true
+  load-fail-kick-message: "&c[FastSync] Failed to load your data."
+  lock-timeout-kick-message: "&c[FastSync] Data locked by another server."
+  periodic-save: false
+  periodic-save-interval-seconds: 300
+  save-on-death: false
+  save-on-world-save: true
+  cancel-commands-while-locked: false
+
+cluster-id: ""
+
+snapshot:
+  enabled: true
+  max-snapshots: 16
+  backup-frequency-ms: 14400000
+
+compression:
+  enabled: true
+  type: "LZ4"
+  min-size: 128
+
+serialization:
+  format-version: 1
+
+debug: true
+log-timing: true
+
+conflict:
+  recovery-strategy: "snapshot"
+  verify-checksum: false
+
+latency:
+  enabled: false
+  window-size: 1000
+
+operation-log:
+  enabled: true
+  retention: 100
