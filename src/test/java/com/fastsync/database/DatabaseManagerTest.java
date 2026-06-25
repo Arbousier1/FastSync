@@ -86,11 +86,11 @@ class DatabaseManagerTest {
         databaseManager = new DatabaseManager(LOGGER, config);
         databaseManager.initialize();
 
-        // Clean tables before each test
+        // Clean player_data table before each test. The operation_log table is
+        // managed by OperationLogManager and is not touched by these tests.
         try (var conn = databaseManager.getDataSource().getConnection();
              var stmt = conn.createStatement()) {
             stmt.execute("TRUNCATE TABLE " + config.getTablePrefix() + "player_data");
-            stmt.execute("TRUNCATE TABLE " + config.getTablePrefix() + "operation_log");
         }
     }
 
