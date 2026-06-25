@@ -85,8 +85,8 @@ jobs:
       - name: Run E2E verification
         run: ./scripts/e2e-verify.sh
 
-      - name: Collect container logs on failure
-        if: failure()
+      - name: Collect container logs
+        if: always()
         run: |
           mkdir -p e2e-logs
           for c in fastsync-mysql fastsync-redis fastsync-paper-a fastsync-paper-b; do
