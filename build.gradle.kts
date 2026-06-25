@@ -16,8 +16,7 @@ repositories {
     maven("https://repo.papermc.io/repository/maven-public/")
     maven("https://oss.sonatype.org/content/repositories/snapshots/")
     maven("https://jitpack.io")
-    // Local Maven cache as a fallback (Sparrow artifacts are not on any public mirror)
-    mavenLocal()
+    // Sparrow 库通过 Git Submodule + Composite Build 引入（见 settings.gradle.kts），不再需要 mavenLocal。
 }
 
 group = property("group") as String
@@ -48,7 +47,7 @@ dependencies {
     compileOnly("io.netty:netty-codec:4.1.115.Final")
     compileOnly("io.netty:netty-resolver:4.1.115.Final")
     // sparrow is provided by Paper (NBT, YAML, and Redis message broker)
-    compileOnly("net.momirealms:sparrow-nbt:0.18.4")
+    compileOnly("net.momirealms:sparrow-nbt:0.18.8")
     compileOnly("net.momirealms:sparrow-yaml:1.0.7")
     compileOnly("net.momirealms:sparrow-redis-message-broker:0.0.7")
 
