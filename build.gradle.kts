@@ -74,8 +74,10 @@ dependencies {
     testImplementation("org.mockito:mockito-junit-jupiter:5.12.0")
     testImplementation("org.openjdk.jmh:jmh-core:1.37")
     testImplementation("org.openjdk.jmh:jmh-generator-annprocess:1.37")
-    // Test classpath needs Paper API types (JavaPlugin, Server, etc.)
-    testCompileOnly("io.papermc.paper:paper-api:${paperVersion}-R0.1-SNAPSHOT")
+    // Paper API must be on the test *runtime* classpath too, because
+    // ConfigManager (and other production classes loaded by tests) reference
+    // JavaPlugin directly. testCompileOnly caused ClassNotFoundException at test time.
+    testImplementation("io.papermc.paper:paper-api:${paperVersion}-R0.1-SNAPSHOT")
 }
 
 java {
