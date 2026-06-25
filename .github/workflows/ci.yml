@@ -49,6 +49,13 @@ jobs:
       - name: Run gradle build
         run: ./gradlew build --no-daemon --stacktrace
 
+      - name: Print test results on failure
+        if: failure()
+        run: |
+          echo "=== Test results XML ==="
+          find build/test-results/test -name "*.xml" -exec cat {} \; || true
+          echo "=== End test results ==="
+
       - name: Run gradle test
         run: ./gradlew test --no-daemon --info
 
@@ -129,6 +136,13 @@ jobs:
 
       - name: Run full CI pipeline
         run: ./gradlew ci --no-daemon --stacktrace
+
+      - name: Print test results on failure
+        if: failure()
+        run: |
+          echo "=== Test results XML ==="
+          find build/test-results/test -name "*.xml" -exec cat {} \; || true
+          echo "=== End test results ==="
 
       - name: Upload all artifacts
         if: always()
