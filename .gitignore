@@ -1,0 +1,25 @@
+target/
+*.class
+*.log
+*.jar
+*.war
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.project
+.classpath
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Maven
+maven-archiver/
+maven-status/
+surefire-reports/
+
+# JMH
+jmh_generated/

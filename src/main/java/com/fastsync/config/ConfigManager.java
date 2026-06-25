@@ -1,0 +1,435 @@
+package com.fastsync.config;
+
+import net.momirealms.sparrow.yaml.SparrowYaml;
+import net.momirealms.sparrow.yaml.YamlDocument;
+import org.bukkit.configuration.file.FileConfiguration;
+import org.bukkit.plugin.java.JavaPlugin;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.logging.Level;
+
+/**
+ * Manages FastSync configuration loading and access.
+ *
+ * <p>Configuration is loaded from {@code config.yml} using the sparrow-yaml
+ * library (which preserves comments and supports config version migration). If
+ * sparrow-yaml fails to parse the file for any reason, the loader transparently
+ * falls back to Bukkit's {@link FileConfiguration} as a safety net so the plugin
+ * can still start.</p>
+ */
+public class ConfigManager {
+
+    private final JavaPlugin plugin;
+    private final SparrowYaml yaml;
+    private YamlDocument doc;
+
+    // Server
+    private String serverName;
+
+    // Database
+    private String dbType;
+    private String dbHost;
+    private int dbPort;
+    private String dbDatabase;
+    private String dbUsername;
+    private String dbPassword;
+    private String tablePrefix;
+    private int poolSize;
+    private long connectionTimeout;
+    private long idleTimeout;
+    private long maxLifetime;
+    private long leakDetectionThreshold;
+    private String dbParameters;
+
+    // Redis
+    private boolean redisEnabled;
+    private String redisHost;
+    private int redisPort;
+    private String redisPassword;
+    private int redisDatabase;
+    private boolean redisSsl;
+    private int redisTimeout;
+    private String redisChannelPrefix;
+    private boolean redisCacheEnabled;
+
+    // Sync
+    private boolean syncInventory;
+    private boolean syncEnderChest;
+    private boolean syncHealth;
+    private boolean syncFood;
+    private boolean syncExperience;
+    private boolean syncPotionEffects;
+    private boolean syncGameMode;
+    private boolean syncFireTicks;
+    private boolean syncAir;
+    private boolean syncExtraData;
+    private int lockTimeout;
+    private long lockRetryIntervalMs;
+    private int lockMaxRetries;
+    private int saveDelay;
+    private boolean clearBeforeApply;
+    private String loadFailKickMessage;
+    private String lockTimeoutKickMessage;
+    private boolean periodicSave;
+    private int periodicSaveIntervalSeconds;
+
+    // Sync - new features
+    private boolean syncAdvancements;
+    private boolean syncStatistics;
+    private boolean syncAttributes;
+    private boolean syncFlight;
+    private boolean syncPDC;
+    private boolean syncLocation;
+    private boolean syncLockedMaps;
+
+    // Snapshot
+    private boolean snapshotEnabled;
+    private int maxSnapshots;
+    private long snapshotBackupFrequencyMs;
+
+    // Death save
+    private boolean saveOnDeath;
+    private boolean saveOnWorldSave;
+
+    // Cluster
+    private String clusterId;
+
+    // Locked commands while loading
+    private boolean cancelCommandsWhileLocked;
+
+    // Compression
+    private boolean compressionEnabled;
+    private String compressionType;
+    private int compressionMinSize;
+
+    // Serialization
+    private byte formatVersion;
+
+    // Debug
+    private boolean debug;
+    private boolean logTiming;
+
+    // Dynamo-style conflict recovery
+    private String conflictRecoveryStrategy; // "snapshot", "discard", "overwrite"
+    private boolean verifyChecksum;
+    private int latencyWindowSize;
+    private boolean latencyTrackingEnabled;
+
+    // Raft-inspired operation log
+    private boolean operationLogEnabled;
+    private int operationLogRetention; // max entries per UUID to keep
+
+    // Redis Streams (critical event delivery)
+    private boolean streamsEnabled;
+
+    public ConfigManager(JavaPlugin plugin) {
+        this.plugin = plugin;
+        this.yaml = SparrowYaml.builder().build();
+    }
+
+    public void load() {
+        // Copy config.yml from the JAR if it does not already exist (Bukkit handles this)
+        plugin.saveDefaultConfig();
+        File configFile = new File(plugin.getDataFolder(), "config.yml");
+
+        // Primary path: parse with sparrow-yaml (preserves comments, typed access)
+        YamlDocument loaded = null;
+        try {
+            loaded = yaml.load(configFile);
+        } catch (IOException e) {
+            plugin.getLogger().log(Level.SEVERE,
+                "Failed to parse config.yml with sparrow-yaml. Falling back to Bukkit config.", e);
+        }
+        this.doc = loaded;
+
+        // Safety net: if sparrow-yaml could not parse the file, use Bukkit's FileConfiguration
+        ConfigSource source;
+        if (loaded != null) {
+            source = new SparrowConfigSource(loaded);
+        } else {
+            source = new BukkitConfigSource(plugin.getConfig());
+        }
+        assignValues(source);
+    }
+
+    public void reload() {
+        // Re-read the config file (sparrow-yaml re-parses it inside load())
+        load();
+    }
+
+    /**
+     * Reads every configuration value through the provided {@link ConfigSource}.
+     * This keeps the sparrow-yaml and Bukkit fallback paths identical without
+     * duplicating the field assignments.
+     */
+    private void assignValues(ConfigSource source) {
+        // Server
+        serverName = source.getString("server-name", "survival-1");
+
+        // Database
+        dbType = source.getString("database.type", "mysql");
+        dbHost = source.getString("database.host", "localhost");
+        dbPort = source.getInt("database.port", 3306);
+        dbDatabase = source.getString("database.database", "minecraft");
+        dbUsername = source.getString("database.username", "root");
+        dbPassword = source.getString("database.password", "password");
+        tablePrefix = source.getString("database.table-prefix", "fastsync_");
+        poolSize = source.getInt("database.pool-size", 10);
+        connectionTimeout = source.getLong("database.connection-timeout", 10000);
+        idleTimeout = source.getLong("database.idle-timeout", 300000);
+        maxLifetime = source.getLong("database.max-lifetime", 1800000);
+        leakDetectionThreshold = source.getLong("database.leak-detection-threshold", 60000);
+        dbParameters = source.getString("database.parameters",
+            "useSSL=false&useUnicode=true&characterEncoding=UTF-8&autoReconnect=true");
+
+        // Redis
+        redisEnabled = source.getBoolean("redis.enabled", false);
+        redisHost = source.getString("redis.host", "localhost");
+        redisPort = source.getInt("redis.port", 6379);
+        redisPassword = source.getString("redis.password", "");
+        redisDatabase = source.getInt("redis.database", 0);
+        redisSsl = source.getBoolean("redis.ssl", false);
+        redisTimeout = source.getInt("redis.timeout", 5000);
+        redisChannelPrefix = source.getString("redis.channel-prefix", "fastsync:lock:");
+        redisCacheEnabled = source.getBoolean("redis.cache-enabled", false);
+
+        // Sync
+        syncInventory = source.getBoolean("sync.sync-inventory", true);
+        syncEnderChest = source.getBoolean("sync.sync-ender-chest", true);
+        syncHealth = source.getBoolean("sync.sync-health", true);
+        syncFood = source.getBoolean("sync.sync-food", true);
+        syncExperience = source.getBoolean("sync.sync-experience", true);
+        syncPotionEffects = source.getBoolean("sync.sync-potion-effects", true);
+        syncGameMode = source.getBoolean("sync.sync-game-mode", true);
+        syncFireTicks = source.getBoolean("sync.sync-fire-ticks", true);
+        syncAir = source.getBoolean("sync.sync-air", true);
+        syncExtraData = source.getBoolean("sync.sync-extra-data", true);
+        lockTimeout = source.getInt("sync.lock-timeout", 30);
+        lockRetryIntervalMs = source.getLong("sync.lock-retry-interval-ms", 1000);
+        lockMaxRetries = source.getInt("sync.lock-max-retries", 30);
+        saveDelay = source.getInt("sync.save-delay", 0);
+        clearBeforeApply = source.getBoolean("sync.clear-before-apply", true);
+        loadFailKickMessage = source.getString("sync.load-fail-kick-message",
+            "&c[FastSync] Failed to load your player data. Please try reconnecting.");
+        lockTimeoutKickMessage = source.getString("sync.lock-timeout-kick-message",
+            "&c[FastSync] Your data is still being saved by another server.");
+        periodicSave = source.getBoolean("sync.periodic-save", false);
+        periodicSaveIntervalSeconds = source.getInt("sync.periodic-save-interval-seconds", 300);
+
+        // Sync - new features
+        syncAdvancements = source.getBoolean("sync.sync-advancements", true);
+        syncStatistics = source.getBoolean("sync.sync-statistics", true);
+        syncAttributes = source.getBoolean("sync.sync-attributes", true);
+        syncFlight = source.getBoolean("sync.sync-flight", true);
+        syncPDC = source.getBoolean("sync.sync-pdc", true);
+        syncLocation = source.getBoolean("sync.sync-location", false);
+        syncLockedMaps = source.getBoolean("sync.sync-locked-maps", true);
+
+        // Snapshot
+        snapshotEnabled = source.getBoolean("snapshot.enabled", true);
+        maxSnapshots = source.getInt("snapshot.max-snapshots", 16);
+        snapshotBackupFrequencyMs = source.getLong("snapshot.backup-frequency-ms", 14400000);
+
+        // Death save
+        saveOnDeath = source.getBoolean("sync.save-on-death", false);
+        saveOnWorldSave = source.getBoolean("sync.save-on-world-save", true);
+
+        // Cluster
+        clusterId = source.getString("cluster-id", "");
+
+        // Locked commands while loading
+        cancelCommandsWhileLocked = source.getBoolean("sync.cancel-commands-while-locked", false);
+
+        // Compression
+        compressionEnabled = source.getBoolean("compression.enabled", true);
+        compressionType = source.getString("compression.type", "LZ4");
+        compressionMinSize = source.getInt("compression.min-size", 128);
+
+        // Serialization
+        formatVersion = (byte) source.getInt("serialization.format-version", 1);
+
+        // Debug
+        debug = source.getBoolean("debug", false);
+        logTiming = source.getBoolean("log-timing", false);
+
+        // Dynamo-style conflict recovery
+        conflictRecoveryStrategy = source.getString("conflict.recovery-strategy", "snapshot");
+        verifyChecksum = source.getBoolean("conflict.verify-checksum", true);
+        latencyWindowSize = source.getInt("latency.window-size", 1000);
+        latencyTrackingEnabled = source.getBoolean("latency.enabled", false);
+
+        // Raft-inspired operation log
+        operationLogEnabled = source.getBoolean("operation-log.enabled", true);
+        operationLogRetention = source.getInt("operation-log.retention", 100);
+        streamsEnabled = source.getBoolean("redis.streams-enabled", true);
+    }
+
+    // ==================== Getters ====================
+
+    public String getServerName() { return serverName; }
+
+    public String getDbType() { return dbType; }
+    public String getDbHost() { return dbHost; }
+    public int getDbPort() { return dbPort; }
+    public String getDbDatabase() { return dbDatabase; }
+    public String getDbUsername() { return dbUsername; }
+    public String getDbPassword() { return dbPassword; }
+    public String getTablePrefix() { return tablePrefix; }
+    public int getPoolSize() { return poolSize; }
+    public long getConnectionTimeout() { return connectionTimeout; }
+    public long getIdleTimeout() { return idleTimeout; }
+    public long getMaxLifetime() { return maxLifetime; }
+    public long getLeakDetectionThreshold() { return leakDetectionThreshold; }
+    public String getDbParameters() { return dbParameters; }
+
+    public boolean isRedisEnabled() { return redisEnabled; }
+    public String getRedisHost() { return redisHost; }
+    public int getRedisPort() { return redisPort; }
+    public String getRedisPassword() { return redisPassword; }
+    public int getRedisDatabase() { return redisDatabase; }
+    public boolean isRedisSsl() { return redisSsl; }
+    public int getRedisTimeout() { return redisTimeout; }
+    public String getRedisChannelPrefix() { return redisChannelPrefix; }
+    public boolean isRedisCacheEnabled() { return redisCacheEnabled; }
+
+    public boolean isSyncInventory() { return syncInventory; }
+    public boolean isSyncEnderChest() { return syncEnderChest; }
+    public boolean isSyncHealth() { return syncHealth; }
+    public boolean isSyncFood() { return syncFood; }
+    public boolean isSyncExperience() { return syncExperience; }
+    public boolean isSyncPotionEffects() { return syncPotionEffects; }
+    public boolean isSyncGameMode() { return syncGameMode; }
+    public boolean isSyncFireTicks() { return syncFireTicks; }
+    public boolean isSyncAir() { return syncAir; }
+    public boolean isSyncExtraData() { return syncExtraData; }
+    public int getLockTimeout() { return lockTimeout; }
+    public long getLockRetryIntervalMs() { return lockRetryIntervalMs; }
+    public int getLockMaxRetries() { return lockMaxRetries; }
+    public int getSaveDelay() { return saveDelay; }
+    public boolean isClearBeforeApply() { return clearBeforeApply; }
+    public String getLoadFailKickMessage() { return loadFailKickMessage; }
+    public String getLockTimeoutKickMessage() { return lockTimeoutKickMessage; }
+    public boolean isPeriodicSave() { return periodicSave; }
+    public int getPeriodicSaveIntervalSeconds() { return periodicSaveIntervalSeconds; }
+
+    public boolean isSyncAdvancements() { return syncAdvancements; }
+    public boolean isSyncStatistics() { return syncStatistics; }
+    public boolean isSyncAttributes() { return syncAttributes; }
+    public boolean isSyncFlight() { return syncFlight; }
+    public boolean isSyncPDC() { return syncPDC; }
+    public boolean isSyncLocation() { return syncLocation; }
+    public boolean isSyncLockedMaps() { return syncLockedMaps; }
+
+    public boolean isSnapshotEnabled() { return snapshotEnabled; }
+    public int getMaxSnapshots() { return maxSnapshots; }
+    public long getSnapshotBackupFrequencyMs() { return snapshotBackupFrequencyMs; }
+
+    public boolean isSaveOnDeath() { return saveOnDeath; }
+    public boolean isSaveOnWorldSave() { return saveOnWorldSave; }
+
+    public String getClusterId() { return clusterId; }
+
+    public boolean isCancelCommandsWhileLocked() { return cancelCommandsWhileLocked; }
+
+    public boolean isCompressionEnabled() { return compressionEnabled; }
+    public String getCompressionType() { return compressionType; }
+    public int getCompressionMinSize() { return compressionMinSize; }
+
+    public byte getFormatVersion() { return formatVersion; }
+
+    public boolean isDebug() { return debug; }
+    public boolean isLogTiming() { return logTiming; }
+
+    public String getConflictRecoveryStrategy() { return conflictRecoveryStrategy; }
+    public boolean isVerifyChecksum() { return verifyChecksum; }
+    public int getLatencyWindowSize() { return latencyWindowSize; }
+    public boolean isLatencyTrackingEnabled() { return latencyTrackingEnabled; }
+
+    public boolean isOperationLogEnabled() { return operationLogEnabled; }
+    public int getOperationLogRetention() { return operationLogRetention; }
+    public boolean isStreamsEnabled() { return streamsEnabled; }
+
+    // ==================== Internal config access abstraction ====================
+
+    /**
+     * Minimal read-only abstraction over a configuration source, so the value
+     * assignment logic can be shared between the sparrow-yaml primary path and
+     * the Bukkit fallback path.
+     */
+    private interface ConfigSource {
+        String getString(String key, String def);
+        int getInt(String key, int def);
+        long getLong(String key, long def);
+        boolean getBoolean(String key, boolean def);
+    }
+
+    /**
+     * {@link ConfigSource} backed by a sparrow-yaml {@link YamlDocument}. Dotted
+     * keys (e.g. {@code "database.host"}) are split into the varargs route that
+     * sparrow-yaml expects (e.g. {@code "database", "host"}).
+     */
+    private static final class SparrowConfigSource implements ConfigSource {
+        private final YamlDocument document;
+
+        SparrowConfigSource(YamlDocument document) {
+            this.document = document;
+        }
+
+        private static Object[] route(String key) {
+            return key.split("\\.");
+        }
+
+        @Override
+        public String getString(String key, String def) {
+            return document.getOrDefault(String.class, def, route(key));
+        }
+
+        @Override
+        public int getInt(String key, int def) {
+            return document.getOrDefault(Integer.class, def, route(key));
+        }
+
+        @Override
+        public long getLong(String key, long def) {
+            return document.getOrDefault(Long.class, def, route(key));
+        }
+
+        @Override
+        public boolean getBoolean(String key, boolean def) {
+            return document.getOrDefault(Boolean.class, def, route(key));
+        }
+    }
+
+    /**
+     * {@link ConfigSource} backed by Bukkit's {@link FileConfiguration}. Used
+     * only as a safety net when sparrow-yaml cannot parse the file.
+     */
+    private static final class BukkitConfigSource implements ConfigSource {
+        private final FileConfiguration config;
+
+        BukkitConfigSource(FileConfiguration config) {
+            this.config = config;
+        }
+
+        @Override
+        public String getString(String key, String def) {
+            return config.getString(key, def);
+        }
+
+        @Override
+        public int getInt(String key, int def) {
+            return config.getInt(key, def);
+        }
+
+        @Override
+        public long getLong(String key, long def) {
+            return config.getLong(key, def);
+        }
+
+        @Override
+        public boolean getBoolean(String key, boolean def) {
+            return config.getBoolean(key, def);
+        }
+    }
+}
