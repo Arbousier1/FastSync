@@ -50,6 +50,10 @@ done
 echo "Plugin: ${PLUGINS_DIR}/${MAIN_JAR}"
 echo "Runtime libs: $(ls -1 "${PLUGINS_DIR}/lib" | wc -l) jar(s)"
 
+# The itzg/minecraft-server container runs as uid 1000 and needs write access
+# to /data/plugins so Paper can create its .paper-remapped cache.
+chmod -R 777 "${PLUGINS_DIR}"
+
 echo "[3/5] Starting MySQL, Redis and two Paper servers..."
 docker compose -f "${COMPOSE_FILE}" down -v || true
 docker compose -f "${COMPOSE_FILE}" up -d

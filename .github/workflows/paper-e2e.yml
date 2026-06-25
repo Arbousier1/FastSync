@@ -56,6 +56,9 @@ jobs:
               cp "$jar" e2e/plugins/lib/
             fi
           done
+          # The itzg/minecraft-server container runs as uid 1000 and needs
+          # write access to /data/plugins for Paper's .paper-remapped cache.
+          chmod -R 777 e2e/plugins
           echo "Runtime libs copied: $(ls -1 e2e/plugins/lib | wc -l)"
 
       - name: Start Paper E2E environment
