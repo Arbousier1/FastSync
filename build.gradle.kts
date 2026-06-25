@@ -1,7 +1,3 @@
-plugins {
-    java
-}
-
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.file.Files
@@ -10,6 +6,10 @@ import java.util.jar.JarFile
 import java.util.jar.JarOutputStream
 import java.util.zip.ZipEntry
 import org.gradle.api.file.DuplicatesStrategy
+
+plugins {
+    java
+}
 
 repositories {
     mavenCentral()
@@ -30,17 +30,22 @@ val paperVersion: String = property("paper.version") as String
 // =============================================================================
 //
 // Pattern: NO shade. The JAR is built with the runtime classpath, but
-// those classes are NOT bundled inside the JAR. Instead, the runtimeOnly
+// those classes are NOT bundled inside the JAR. Instead, the runtime
 // artifacts are copied to build/libs/ via the `copyRuntimeLibs` task.
 // Paper's plugin loader picks up the lib/ folder automatically.
 //
+// The JAR manifest declares `paperweight-mappings-namespace: mojang`, so
+// Paper 1.20.5+ skips its plugin remapper and the Class-Path manifest
+// resolves correctly against lib/.
+//
 // This avoids relocation conflicts when multiple plugins depend on
-// different versions of the same library (e.g., two plugins using
-// different HikariCP versions no longer classpath-clash).
+// different versions of the same library.
 // =============================================================================
 dependencies {
-    // Compile-only: provided by the server at runtime
+    // Compile-only: provided by Paper/Folia at runtime
     compileOnly("io.papermc.paper:paper-api:${paperVersion}-R0.1-SNAPSHOT")
+
+    // Velocity proxy API
     compileOnly("com.velocitypowered:velocity-api:3.4.0-SNAPSHOT")
     compileOnly("org.slf4j:slf4j-api:2.0.13")
     compileOnly("io.netty:netty-bom:4.1.115.Final")
@@ -78,8 +83,7 @@ dependencies {
     testImplementation("org.openjdk.jmh:jmh-core:1.37")
     testImplementation("org.openjdk.jmh:jmh-generator-annprocess:1.37")
     // Paper API must be on the test *runtime* classpath too, because
-    // ConfigManager (and other production classes loaded by tests) reference
-    // JavaPlugin directly. testCompileOnly caused ClassNotFoundException at test time.
+    // production classes loaded by tests reference Bukkit/Paper classes.
     testImplementation("io.papermc.paper:paper-api:${paperVersion}-R0.1-SNAPSHOT")
 }
 
@@ -241,7 +245,11 @@ tasks.jar {
         attributes(
             "Implementation-Title" to "FastSync",
             "Implementation-Version" to project.version.toString(),
-            "Multi-Release" to "true"
+            "Multi-Release" to "true",
+            // Tell Paper 1.20.5+ that this plugin is already Mojang-mapped,
+            // so it skips the PluginRemapper. This keeps the Class-Path
+            // manifest valid relative to the plugin jar.
+            "paperweight-mappings-namespace" to "mojang"
         )
     }
 
@@ -302,39 +310,8 @@ val copyRuntimeLibs = tasks.register<Copy>("copyRuntimeLibs") {
     }
 }
 
-// =============================================================================
-// Fat JAR: bundles runtime dependencies (Paper does not load Class-Path libs)
-// =============================================================================
-// Paper's plugin remapper ignores the Class-Path manifest, so the lib/ folder
-// pattern used above does not work at runtime. For environments that need a
-// single deployable artifact, this task produces a fat jar with all runtime
-// dependencies embedded (no relocation / no shade).
-// =============================================================================
-val fatJar = tasks.register<Jar>("fatJar") {
-    group = "build"
-    description = "Packages a standalone Paper/Folia plugin JAR with all runtime dependencies embedded (no shade)."
-    archiveBaseName.set("FastSync-All")
-    archiveVersion.set(version.toString())
-    from(sourceSets["main"].output)
-    from({
-        configurations.runtimeClasspath.get().map { f ->
-            if (f.isDirectory) f else zipTree(f)
-        }
-    })
-    exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA",
-            "META-INF/maven/**", "META-INF/LICENSE*", "META-INF/NOTICE*")
-    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
-    manifest {
-        attributes(
-            "Implementation-Title" to "FastSync",
-            "Implementation-Version" to project.version.toString(),
-            "Multi-Release" to "true"
-        )
-    }
-}
-
 tasks.named("assemble") {
-    dependsOn(velocityJar, copyRuntimeLibs, fatJar)
+    dependsOn(velocityJar, copyRuntimeLibs)
 }
 
 tasks.named("check") {
