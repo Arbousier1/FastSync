@@ -63,6 +63,8 @@ dependencies {
     // Test
     testImplementation(platform("org.junit:junit-bom:6.1.0"))
     testImplementation("org.junit.jupiter:junit-jupiter")
+    // Gradle 9.x no longer auto-adds the JUnit Platform launcher.
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
     // Note: testcontainers sub-modules (mysql, junit-jupiter) don't have 2.0.x
     // releases yet. Keep sub-modules on 1.21.4 until they catch up.
     testImplementation("org.testcontainers:testcontainers:2.0.5")
