@@ -1831,6 +1831,18 @@ public class SyncManager {
                 // Force full collect + dirty-mark everything to ensure checksum
                 // comparison happens in persistCollectedData.
                 dirtyMask.markAllDirty(uuid);
+            } else if (config.isComponentStorageEnabled()) {
+                // Conservative dirty strategy for components without event coverage.
+                // DirtyTrackingListener does NOT cover: PDC changes (no events),
+                // Statistics changes (no granular events), Attribute changes (rare).
+                // When component-storage is enabled, these components would only
+                // be written during validation saves (every Nth cycle). To avoid
+                // losing changes between validations, conservatively mark them
+                // dirty on every periodic save when component-storage is on.
+                dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.PDC);
+                dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.STATISTICS);
+                dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.ATTRIBUTES);
+                dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.ADVANCEMENTS);
             }
         }
 
@@ -2286,10 +2298,13 @@ public class SyncManager {
             long serElapsed = (System.nanoTime() - startSer) / 1_000_000;
             if (serializeLatency != null) serializeLatency.record(serElapsed);
 
-            // Batch upsert all dirty components in one transaction
+            // Batch upsert all dirty components in one transaction.
+            // Pass serverName + fencingToken so the DB layer can verify we
+            // still hold the lock before writing any component rows.
             long dbStart = System.nanoTime();
             java.util.Map<String, Long> newVersions =
-                databaseManager.upsertComponentsBatch(uuid, componentBlobs, componentChecksums);
+                databaseManager.upsertComponentsBatch(uuid, componentBlobs, componentChecksums,
+                    config.getServerName(), data.getFencingToken());
             long dbElapsed = (System.nanoTime() - dbStart) / 1_000_000;
             if (saveLatency != null) saveLatency.record(dbElapsed);
 
@@ -2425,11 +2440,23 @@ public class SyncManager {
 
             boolean saved;
             if (kind.releaseLock) {
-                // Final save (quit): release lock after successful write
-                saved = databaseManager.saveDataAndReleaseLock(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
+                // Final save (quit): release lock after successful write.
+                // If component-storage is enabled, use the ClearComponents variant
+                // to atomically delete stale component rows + reset bitmap,
+                // preventing stale override on next login.
+                if (config.isComponentStorageEnabled()) {
+                    saved = databaseManager.saveDataAndReleaseLockClearComponents(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
+                } else {
+                    saved = databaseManager.saveDataAndReleaseLock(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
+                }
             } else {
-                // Online save (periodic/bulk/world_save/death): keep lock, refresh locked_at
-                saved = databaseManager.saveDataKeepLock(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
+                // Online save (periodic/bulk/world_save/death): keep lock, refresh locked_at.
+                // Same ClearComponents logic applies — full Blob is the new baseline.
+                if (config.isComponentStorageEnabled()) {
+                    saved = databaseManager.saveDataKeepLockClearComponents(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
+                } else {
+                    saved = databaseManager.saveDataKeepLock(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
+                }
             }
 
             long saveElapsedMs = (System.nanoTime() - saveStart) / 1_000_000;
@@ -2467,9 +2494,17 @@ public class SyncManager {
 
                     // Retry the save with the actual version
                     if (kind.releaseLock) {
-                        saved = databaseManager.saveDataAndReleaseLock(uuid, compressed, checksum, actualVersion, fencingToken, config.getServerName());
+                        if (config.isComponentStorageEnabled()) {
+                            saved = databaseManager.saveDataAndReleaseLockClearComponents(uuid, compressed, checksum, actualVersion, fencingToken, config.getServerName());
+                        } else {
+                            saved = databaseManager.saveDataAndReleaseLock(uuid, compressed, checksum, actualVersion, fencingToken, config.getServerName());
+                        }
                     } else {
-                        saved = databaseManager.saveDataKeepLock(uuid, compressed, checksum, actualVersion, fencingToken, config.getServerName());
+                        if (config.isComponentStorageEnabled()) {
+                            saved = databaseManager.saveDataKeepLockClearComponents(uuid, compressed, checksum, actualVersion, fencingToken, config.getServerName());
+                        } else {
+                            saved = databaseManager.saveDataKeepLock(uuid, compressed, checksum, actualVersion, fencingToken, config.getServerName());
+                        }
                     }
 
                     if (saved) {
@@ -2519,6 +2554,15 @@ public class SyncManager {
 
             // 5b. Success: advance version + log + snapshot + publish
             advanceVersion(uuid, expectedVersion);
+
+            // Full Blob save contains the latest state of all enabled components,
+            // so all dirty flags can be cleared. Without this, a player who was
+            // once marked dirty would stay dirty forever (in component-storage=false
+            // mode), causing every subsequent periodic save to do a full collect +
+            // serialize + DB write — defeating the dirty tracking optimization.
+            if (dirtyMask != null) {
+                dirtyMask.clearAll(uuid);
+            }
 
                 if (snapshotManager != null && shouldCreateSnapshot(data.getSaveCause())) {
                     snapshotManager.createSnapshot(uuid, compressed, data.getSaveCause())
