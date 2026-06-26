@@ -1,9 +1,8 @@
 package com.fastsync.concurrent;
 
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
@@ -12,32 +11,26 @@ import java.util.logging.Logger;
 /**
  * Dedicated thread pool for FastSync async operations.
  *
- * Replaces CompletableFuture.runAsync() (which uses ForkJoinPool.commonPool)
- * with a properly sized, named, and manageable thread pool.
+ * <p>Replaces {@code CompletableFuture.runAsync()} (which uses
+ * {@code ForkJoinPool.commonPool}) with a properly sized, named, and
+ * manageable thread pool.
  *
- * Thread management is critical for sync plugins - HuskSync's poor thread
+ * <p>Thread management is critical for sync plugins — HuskSync's poor thread
  * management was specifically criticized. This executor provides:
- *   - Named threads for easy debugging
- *   - Bounded pool size AND bounded queue to prevent OOM under load
- *   - AbortPolicy: when queue is full, throw RejectedExecutionException
- *     instead of running DB I/O on the calling thread (Folia-safe).
- *     Callers are responsible for catching and handling the rejection:
- *     quit saves fall back to synchronous execution, periodic saves skip.
- *   - Graceful shutdown with timeout
- *   - Proper exception logging
+ * <ul>
+ *   <li>Named threads for easy debugging</li>
+ *   <li>Bounded pool size to prevent resource exhaustion</li>
+ *   <li>Graceful shutdown with timeout</li>
+ *   <li>Proper exception logging via {@link Logger} (not stderr)</li>
+ * </ul>
  */
 public class AsyncExecutor {
 
-    private final ThreadPoolExecutor executor;
+    private final ExecutorService executor;
     private final Logger logger;
     private final String poolName;
 
-    /**
-     * @param poolSize      number of threads
-     * @param queueCapacity max tasks pending in queue (0 = unbounded not allowed;
-     *                      use a positive value to prevent OOM under login storms)
-     */
-    public AsyncExecutor(Logger logger, String poolName, int poolSize, int queueCapacity) {
+    public AsyncExecutor(Logger logger, String poolName, int poolSize) {
         this.logger = logger;
         this.poolName = poolName;
 
@@ -53,61 +46,27 @@ public class AsyncExecutor {
             }
         };
 
-        int actualPoolSize = Math.max(2, poolSize);
-        int actualQueueCapacity = Math.max(64, queueCapacity);
-
-        // Use AbortPolicy: when queue is full, throw RejectedExecutionException.
-        // This is safer than CallerRunsPolicy — it NEVER runs DB I/O on the
-        // calling thread (which might be a Folia region/entity thread).
-        // Callers must catch RejectedExecutionException and handle it:
-        //   - quit save: fallback to synchronous save or release lock + log
-        //   - periodic save: skip (coalescing)
-        //   - bulk save: record failure in statistics
-        this.executor = new ThreadPoolExecutor(
-            actualPoolSize,
-            actualPoolSize,
-            0L,
-            TimeUnit.MILLISECONDS,
-            new LinkedBlockingQueue<>(actualQueueCapacity),
-            threadFactory,
-            new ThreadPoolExecutor.AbortPolicy()
+        this.executor = Executors.newFixedThreadPool(
+            Math.max(2, poolSize),
+            threadFactory
         );
 
-        logger.info("Async executor '" + poolName + "' initialized: "
-            + actualPoolSize + " threads, queue capacity " + actualQueueCapacity
-            + ", backpressure=AbortPolicy (rejects on queue full; callers handle fallback).");
-    }
-
-    /**
-     * Legacy constructor — uses a default queue capacity of 256.
-     */
-    public AsyncExecutor(Logger logger, String poolName, int poolSize) {
-        this(logger, poolName, poolSize, 256);
+        logger.info("Async executor '" + poolName + "' initialized with " + poolSize + " threads.");
     }
 
     /**
      * Submit a task for async execution.
-     * Exceptions are logged automatically.
-     * If the queue is full, RejectedExecutionException is thrown (AbortPolicy).
-     * Callers must catch this and handle appropriately (fallback/skip).
+     * Exceptions are logged via the SLF4J/j.u.l logger (not stderr).
      */
     public void execute(Runnable task) {
         executor.execute(() -> {
             try {
                 task.run();
             } catch (Exception e) {
-                logger.log(Level.SEVERE, "[" + poolName + "] Uncaught exception in async task", e);
+                logger.log(Level.SEVERE,
+                    "[" + poolName + "] Uncaught exception in async task: " + e.getMessage(), e);
             }
         });
-    }
-
-    /**
-     * Returns the underlying ExecutorService for use by components that need
-     * to pass an Executor to CompletableFuture.supplyAsync() etc.
-     * This avoids falling back to ForkJoinPool.commonPool().
-     */
-    public ExecutorService getExecutor() {
-        return executor;
     }
 
     /**
@@ -140,16 +99,30 @@ public class AsyncExecutor {
     }
 
     /**
-     * Get the number of active threads.
+     * Get the underlying ExecutorService (for callers that need to await
+     * termination directly, e.g. {@link SyncManager#shutdown}).
+     */
+    public ExecutorService getExecutor() {
+        return executor;
+    }
+
+    /**
+     * Get the number of active tasks.
      */
     public int getActiveCount() {
-        return executor.getActiveCount();
+        if (executor instanceof java.util.concurrent.ThreadPoolExecutor tpe) {
+            return tpe.getActiveCount();
+        }
+        return -1;
     }
 
     /**
      * Get the queue size (pending tasks).
      */
     public int getQueueSize() {
-        return executor.getQueue().size();
+        if (executor instanceof java.util.concurrent.ThreadPoolExecutor tpe) {
+            return tpe.getQueue().size();
+        }
+        return -1;
     }
 }

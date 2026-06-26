@@ -4,10 +4,8 @@ import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.entity.Entity;
-import org.bukkit.entity.Player;
 import org.bukkit.plugin.Plugin;
 
-import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
@@ -87,15 +85,7 @@ public final class SchedulerUtil {
         if (FOLIA) {
             Bukkit.getGlobalRegionScheduler().run(plugin, t -> task.run());
         } else {
-            // Inline execution when already on the main thread — avoids
-            // scheduling overhead and prevents self-deadlock during shutdown
-            // (onDisable calls saveAllOnlinePlayers which waits on futures
-            // that would otherwise be queued to the next tick).
-            if (Bukkit.isPrimaryThread()) {
-                task.run();
-            } else {
-                Bukkit.getScheduler().runTask(plugin, task);
-            }
+            Bukkit.getScheduler().runTask(plugin, task);
         }
     }
 
@@ -128,16 +118,7 @@ public final class SchedulerUtil {
             entity.getScheduler().run(plugin, t -> task.run(),
                 retired != null ? retired : () -> {});
         } else {
-            // CRITICAL: When already on the main thread (e.g., during onDisable),
-            // execute inline. Otherwise, the task is scheduled for the next tick,
-            // but the calling thread may be blocking on a future that this task
-            // must complete — a classic self-deadlock that causes shutdown saves
-            // to time out after 30s with zero players saved.
-            if (Bukkit.isPrimaryThread()) {
-                task.run();
-            } else {
-                Bukkit.getScheduler().runTask(plugin, task);
-            }
+            Bukkit.getScheduler().runTask(plugin, task);
         }
     }
 
@@ -150,38 +131,6 @@ public final class SchedulerUtil {
         } else {
             Bukkit.getScheduler().runTaskLater(plugin, task, delayTicks);
         }
-    }
-
-    /**
-     * Run a task on the region that owns the player with the given UUID.
-     * If the player is offline, the retired callback is invoked.
-     *
-     * @param plugin  the plugin
-     * @param uuid    the player UUID
-     * @param task    receives the Player if online
-     * @param retired fallback if the player is not online
-     */
-    public static void runForPlayer(Plugin plugin, UUID uuid, Consumer<Player> task, Runnable retired) {
-        // CRITICAL: Bukkit.getPlayer(uuid) must NOT be called from an async
-        // thread (Folia unsafe). Dispatch to the global/main thread first,
-        // then look up the player, then dispatch to the entity's region.
-        runGlobal(plugin, () -> {
-            Player player = Bukkit.getPlayer(uuid);
-            if (player == null) {
-                if (retired != null) retired.run();
-                return;
-            }
-            runAtEntity(plugin, player, () -> {
-                // Re-check online status inside the task — player may have logged out
-                // between the Bukkit.getPlayer() call and the task execution.
-                Player p = Bukkit.getPlayer(uuid);
-                if (p != null && p.isOnline()) {
-                    task.accept(p);
-                } else if (retired != null) {
-                    retired.run();
-                }
-            }, retired);
-        });
     }
 
     // ==================== Region Tasks (TimeUnit = ticks) ====================

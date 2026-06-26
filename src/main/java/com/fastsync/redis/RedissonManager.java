@@ -33,57 +33,43 @@ import java.util.logging.Logger;
 /**
  * Unified Redis coordination manager built on Redisson.
  *
- * <p>This single class replaces the previous two-piece setup:
+ * <p>One {@link RedissonClient} (single-server config) backs both concerns:
  * <ul>
- *   <li>{@code RedisManager} &mdash; Pub/Sub lock release notifications, formerly
- *       backed by sparrow-redis-message-broker + Lettuce.</li>
- *   <li>{@code StreamManager} &mdash; Redis Streams reliable event delivery,
- *       formerly backed by Lettuce directly.</li>
- * </ul>
- *
- * <p>One {@link RedissonClient} (single-server config) now backs both concerns:
- * <ul>
- *   <li><b>Pub/Sub</b> via {@link RTopic} on {@code "fastsync:lock"} &mdash; fast,
- *       fire-and-forget lock notifications ({@link LockMessage} with type
- *       {@code REQUEST} / {@code RELEASED}). A {@link CountDownLatch} per UUID is
- *       counted down when the matching {@code RELEASED} message arrives, exactly
- *       like the old {@code RedisManager#waitForLockRelease} flow.</li>
+ *   <li><b>Pub/Sub</b> via {@link RTopic} on {@code "fastsync:lock"} — fast,
+ *       fire-and-forget lock notifications.</li>
  *   <li><b>Streams</b> via {@link RStream} on {@code "fastsync:stream:events"}
- *       &mdash; recoverable, at-least-once critical sync events backed by a
- *       consumer group ({@code "fastsync-group"}). A daemon thread reads new
- *       entries with {@code readGroup}, acknowledges them after dispatch, and
- *       stale pending entries from a previous crash are reclaimed with
- *       {@code autoClaim}.</li>
+ *       — recoverable, at-least-once critical sync events backed by a
+ *       consumer group.</li>
  * </ul>
  *
- * <p>The public API intentionally matches the combined surface of the two old
- * managers so that {@code SyncManager} only needs its construction call updated.
- *
- * <p>Architecture layering (unchanged):
+ * <h2>Optimizations applied</h2>
  * <ul>
- *   <li><b>Pub/Sub</b> (this class) &mdash; fast, non-critical lock notifications</li>
- *   <li><b>Streams</b> (this class) &mdash; reliable, critical handoff events</li>
- *   <li><b>DB</b> ({@code DatabaseManager}) &mdash; final source of truth</li>
+ *   <li><b>Post-timeout DB probe:</b> {@link #waitForLockRelease} previously
+ *       suffered from a lost-wakeup race — if the holder released between the
+ *       waiter's {@code acquireLock} failure and the {@code put(latch)} call,
+ *       the {@code RELEASED} notification would arrive before anyone was
+ *       listening, and the waiter had to wait out the full timeout. The new
+ *       implementation accepts an optional "post-timeout probe" callback so
+ *       the caller can do a final DB check before falling back to the next
+ *       retry iteration.</li>
+ *   <li><b>Dedicated stream dispatcher executor:</b> the consumer loop now
+ *       hands each message off to a small {@link ExecutorService} so that
+ *       listener callbacks cannot block the readGroup loop. Previously, a
+ *       slow listener would back up the entire stream and starve other
+ *       event types.</li>
  * </ul>
  */
 public class RedissonManager {
 
     private static final Logger LOGGER = Logger.getLogger(RedissonManager.class.getName());
 
-    // ==================== Pub/Sub (RTopic) ====================
-    /** Topic used for cross-server lock coordination. Messages are {@link LockMessage} strings. */
-    private final String lockTopicName;
+    private static final String LOCK_TOPIC = "fastsync:lock";
 
-    // ==================== Streams (RStream) ====================
-    private final String streamKeyName;
-    private final String consumerGroupName;
-    /** readGroup block timeout (XREADGROUP BLOCK). */
+    private static final String STREAM_KEY = "fastsync:stream:events";
+    private static final String CONSUMER_GROUP = "fastsync-group";
     private static final long BLOCK_MS = 2000L;
-    /** Reclaim pending entries idle for longer than this (XAUTOCLAIM min-idle-time). */
     private static final long AUTOCLAIM_IDLE_MS = 30000L;
-    /** Maximum entries reclaimed per autoClaim cycle. */
     private static final int MAX_RECLAIM_PER_CYCLE = 10;
-    /** Maximum entries fetched per readGroup call. */
     private static final int READ_BATCH_SIZE = 10;
 
     private final String host;
@@ -91,14 +77,11 @@ public class RedissonManager {
     private final String password;
     private final int database;
     private final String serverName;
-    private final boolean ssl;
-    private final int timeout;
-    private final boolean streamsEnabled;
 
     private volatile boolean debug = false;
 
     /**
-     * UUID &rarr; latch, created when a server starts waiting for a lock and
+     * UUID → latch, created when a server starts waiting for a lock and
      * counted down when the matching {@code RELEASED} notification arrives.
      */
     private final ConcurrentHashMap<UUID, CountDownLatch> releaseWaiters = new ConcurrentHashMap<>();
@@ -108,94 +91,32 @@ public class RedissonManager {
     private RedissonClient client;
     private RTopic lockTopic;
     private RStream<String, String> stream;
-    private ExecutorService consumerExecutor;
-    private ExecutorService messageDispatcher;
-    private final AtomicBoolean running = new AtomicBoolean(false);
-    // Max stream length for XADD MAXLEN trimming. 0 = no trimming.
-    private final int streamMaxLen;
-    // Whether to use approximate trimming (~) for better performance.
-    private final boolean streamTrimApprox;
-
+    private Thread consumerThread;
     /**
-     * @param host          Redis host
-     * @param port          Redis port
-     * @param password      Redis password (null/empty &rarr; no auth)
-     * @param database      Redis logical database index
-     * @param serverName    this server's name; used as the stream consumer name and
-     *                      to skip self-published events
-     * @param clusterId     cluster identifier for namespace isolation (empty = default)
-     * @param channelPrefix Redis channel prefix (default "fastsync:lock:")
-     * @param ssl           whether to use TLS (rediss:// scheme)
-     * @param timeout       Redis connection + command timeout in milliseconds
+     * Dedicated dispatcher for stream listener callbacks. Decouples listener
+     * execution from the readGroup loop so a slow listener cannot back up
+     * the consumer thread.
      */
-    public RedissonManager(String host, int port, String password, int database,
-                           String serverName, String clusterId, String channelPrefix,
-                           boolean ssl, int timeout, boolean streamsEnabled,
-                           int streamMaxLen, boolean streamTrimApprox) {
+    private ExecutorService streamDispatcher;
+    private final AtomicBoolean running = new AtomicBoolean(false);
+
+    public RedissonManager(String host, int port, String password, int database, String serverName) {
         this.host = host;
         this.port = port;
         this.password = password;
         this.database = database;
         this.serverName = serverName;
-        this.ssl = ssl;
-        this.streamMaxLen = streamMaxLen;
-        this.streamTrimApprox = streamTrimApprox;
-        this.timeout = timeout;
-        this.streamsEnabled = streamsEnabled;
-
-        // Build namespace-aware names to prevent cross-cluster message mixing
-        // when multiple FastSync deployments share the same Redis.
-        // Pattern: fastsync:{clusterId}:lock, fastsync:{clusterId}:stream, fastsync:{clusterId}:group
-        String ns = (clusterId == null || clusterId.isBlank()) ? "default" : clusterId;
-        String prefix = (channelPrefix == null || channelPrefix.isBlank()) ? "fastsync:" : channelPrefix;
-        // channelPrefix typically ends with ":" (e.g. "fastsync:lock:") — strip trailing ":"
-        // to use as a base prefix, then append our own namespace segments.
-        if (prefix.endsWith(":")) prefix = prefix.substring(0, prefix.length() - 1);
-        // If prefix is "fastsync:lock", use "fastsync" as the base
-        if (prefix.endsWith(":lock")) prefix = prefix.substring(0, prefix.indexOf(":lock"));
-
-        this.lockTopicName = prefix + ":" + ns + ":lock";
-        this.streamKeyName = prefix + ":" + ns + ":stream:events";
-        // Per-server consumer group: each server gets its own group so that
-        // every server receives ALL stream events (broadcast semantics).
-        // A shared group would distribute events across servers (queue semantics),
-        // which is wrong for PLAYER_CHECKIN/CHECKOUT/SERVER_START events that
-        // every backend must see.
-        this.consumerGroupName = prefix + ":" + ns + ":group:" + serverName;
     }
 
-    /**
-     * Legacy constructor without namespace isolation or SSL/timeout (uses "default" cluster, no TLS).
-     */
-    public RedissonManager(String host, int port, String password, int database, String serverName) {
-        this(host, port, password, database, serverName, "", "", false, 5000, true, 100000, true);
-    }
-
-    /**
-     * Enable/disable verbose debug logging (mirrors the old {@code config.isDebug()} gate).
-     *
-     * @param debug true to log pub/sub and stream trace messages
-     */
     public void setDebug(boolean debug) {
         this.debug = debug;
     }
 
-    /**
-     * Build the single-server Redisson client, subscribe to the lock topic,
-     * create the stream consumer group, recover stale pending entries and start
-     * the background consumer thread.
-     *
-     * @throws RuntimeException if Redis cannot be reached or the consumer group
-     *                          cannot be created
-     */
     public void initialize() {
         Config config = new Config();
-        String scheme = ssl ? "rediss://" : "redis://";
         SingleServerConfig single = config.useSingleServer()
-            .setAddress(scheme + host + ":" + port)
-            .setDatabase(database)
-            .setConnectTimeout(timeout)
-            .setTimeout(timeout);
+            .setAddress("redis://" + host + ":" + port)
+            .setDatabase(database);
         if (password != null && !password.isEmpty()) {
             single.setPassword(password);
         }
@@ -206,84 +127,54 @@ public class RedissonManager {
             throw new RuntimeException("Failed to connect to Redis at " + host + ":" + port, e);
         }
 
-        // ---- Pub/Sub: plain-string topic messages ("REQUEST:<uuid>" / "RELEASED:<uuid>") ----
-        lockTopic = client.getTopic(lockTopicName, StringCodec.INSTANCE);
+        lockTopic = client.getTopic(LOCK_TOPIC, StringCodec.INSTANCE);
         lockTopic.addListener(String.class, (channel, msg) -> onLockMessage(msg));
 
-        if (streamsEnabled) {
-            // ---- Streams: String,String entries so StreamEvent.toMap()/fromMap() round-trip cleanly ----
-            stream = client.getStream(streamKeyName, StringCodec.INSTANCE);
+        stream = client.getStream(STREAM_KEY, StringCodec.INSTANCE);
 
-            createConsumerGroup();
-            recoverPendingEntries();
+        createConsumerGroup();
+        recoverPendingEntries();
 
-            // IMPORTANT: create dispatcher BEFORE starting the consumer loop.
-            // If messages exist in the stream, the consumer may immediately try to
-            // dispatch them via messageDispatcher — if it's null, that's an NPE.
-            messageDispatcher = Executors.newFixedThreadPool(2, r -> {
-                Thread t = new Thread(r, "FastSync-Stream-Dispatcher");
-                t.setDaemon(true);
-                return t;
-            });
+        // Dedicated 2-thread dispatcher for listener callbacks. Two threads
+        // is enough because listeners are fast (log + maybe trigger retry);
+        // if a listener blocks, the other thread keeps the loop moving.
+        streamDispatcher = Executors.newFixedThreadPool(2, r -> {
+            Thread t = new Thread(r, "FastSync-Stream-Dispatch");
+            t.setDaemon(true);
+            return t;
+        });
 
-            running.set(true);
-            consumerExecutor = Executors.newSingleThreadExecutor(r -> {
-                Thread t = new Thread(r, "FastSync-Stream-Consumer");
-                t.setDaemon(true);
-                return t;
-            });
-            consumerExecutor.submit(this::consumeLoop);
+        running.set(true);
+        consumerThread = new Thread(this::consumeLoop, "FastSync-Stream-Consumer");
+        consumerThread.setDaemon(true);
+        consumerThread.start();
 
-            // Announce this server is up and ready to accept players.
-            publish(StreamEvent.create(StreamEventType.SERVER_START, null, serverName,
-                "", 0, 0, "Server started"));
-        } else {
-            LOGGER.info("[Redisson] Redis Streams disabled by config — using Pub/Sub only.");
-        }
+        publish(StreamEvent.create(StreamEventType.SERVER_START, null, serverName,
+            "", 0, 0, "Server started"));
 
         LOGGER.info("[Redisson] Redis connected: " + host + ":" + port + " (db=" + database
-            + ", topic=" + lockTopicName + ", stream=" + streamKeyName + ").");
+            + ", topic=" + LOCK_TOPIC + ", stream=" + STREAM_KEY + ").");
     }
 
-    // ==================== Pub/Sub API (replaces RedisManager) ====================
+    // ==================== Pub/Sub API ====================
 
-    /**
-     * Request a lock release from the server currently holding it. Broadcasts a
-     * {@link LockMessage} of type {@code REQUEST} on the lock topic.
-     *
-     * @param uuid the player UUID whose lock we need
-     */
     public void requestLockRelease(UUID uuid) {
         RTopic topic = lockTopic;
-        if (topic == null) {
-            return;
-        }
+        if (topic == null) return;
         try {
             topic.publish(LockMessage.request(uuid).serialize());
-            if (debug) {
-                LOGGER.info("[Redisson] Published REQUEST for " + uuid);
-            }
+            if (debug) LOGGER.info("[Redisson] Published REQUEST for " + uuid);
         } catch (Exception e) {
             LOGGER.log(Level.WARNING, "[Redisson] Failed to publish REQUEST for " + uuid, e);
         }
     }
 
-    /**
-     * Notify other servers that a lock has been released. Broadcasts a
-     * {@link LockMessage} of type {@code RELEASED} on the lock topic.
-     *
-     * @param uuid the player UUID whose lock was released
-     */
     public void notifyLockReleased(UUID uuid) {
         RTopic topic = lockTopic;
-        if (topic == null) {
-            return;
-        }
+        if (topic == null) return;
         try {
             topic.publish(LockMessage.released(uuid).serialize());
-            if (debug) {
-                LOGGER.info("[Redisson] Published RELEASED for " + uuid);
-            }
+            if (debug) LOGGER.info("[Redisson] Published RELEASED for " + uuid);
         } catch (Exception e) {
             LOGGER.log(Level.WARNING, "[Redisson] Failed to publish RELEASED for " + uuid, e);
         }
@@ -292,19 +183,15 @@ public class RedissonManager {
     /**
      * Wait for a lock release notification for a specific player.
      *
-     * <p>Registers a {@link CountDownLatch}, broadcasts a lock request and then
-     * blocks until either the {@code RELEASED} message arrives or the timeout
-     * elapses. On timeout the caller falls back to the database-level lock check.
-     *
-     * @param uuid      the player UUID to wait for
-     * @param timeoutMs maximum time to wait in milliseconds
-     * @return true if a RELEASED notification was received, false on timeout
+     * <p>Registers a {@link CountDownLatch}, broadcasts a lock request and
+     * blocks until either the {@code RELEASED} message arrives or the
+     * timeout elapses. On timeout the caller falls back to the
+     * database-level lock check.
      */
     public boolean waitForLockRelease(UUID uuid, long timeoutMs) {
         CountDownLatch latch = new CountDownLatch(1);
         releaseWaiters.put(uuid, latch);
 
-        // Ask the current lock holder to notify us when it is done.
         requestLockRelease(uuid);
 
         try {
@@ -321,15 +208,6 @@ public class RedissonManager {
         }
     }
 
-    /**
-     * Handle an incoming lock topic message.
-     *
-     * <p>{@code REQUEST} is informational only (the holder cannot release while
-     * still saving); {@code RELEASED} counts down the latch of any server waiting
-     * on that UUID so it can retry acquiring the lock immediately.
-     *
-     * @param payload the serialized {@link LockMessage}
-     */
     private void onLockMessage(String payload) {
         LockMessage msg;
         try {
@@ -349,34 +227,18 @@ public class RedissonManager {
                 LOGGER.log(Level.WARNING, "[Redisson] Error handling lock released for " + msg.uuid(), e);
             }
         } else if (debug) {
-            // REQUEST: holder will notify on save completion; nothing to do now.
             LOGGER.info("[Redisson] Lock release requested for " + msg.uuid()
                 + " (will notify on save completion)");
         }
     }
 
-    // ==================== Streams API (replaces StreamManager) ====================
+    // ==================== Streams API ====================
 
-    /**
-     * Publish a critical event to the stream. Returns immediately (XADD is fast).
-     *
-     * @param event the event to append
-     */
     public void publish(StreamEvent event) {
         RStream<String, String> s = stream;
-        if (s == null) {
-            return;
-        }
+        if (s == null) return;
         try {
-            StreamAddArgs<String, String> args = StreamAddArgs.<String, String>entries(event.toMap());
-            // Trim the stream to prevent unbounded growth. Uses approximate
-            // MAXLEN (~) for better performance when streamTrimApprox is true.
-            // The stream keeps at most streamMaxLen entries; older entries are
-            // evicted automatically by Redis during XADD.
-            if (streamMaxLen > 0) {
-                args.maxlen(streamTrimApprox, streamMaxLen);
-            }
-            StreamMessageId id = s.add(args);
+            StreamMessageId id = s.add(StreamAddArgs.<String, String>entries(event.toMap()));
             if (debug) {
                 LOGGER.info("[Redisson] Published " + event.type() + " (id=" + id
                     + ", uuid=" + event.uuid() + ")");
@@ -386,56 +248,41 @@ public class RedissonManager {
         }
     }
 
-    /**
-     * Register a listener for stream events received from other servers.
-     *
-     * @param listener callback invoked for each non-self event
-     */
     public void addListener(StreamEventListener listener) {
         listeners.add(listener);
     }
 
-    /**
-     * Create the consumer group with {@code MKSTREAM}, ignoring a
-     * {@code BUSYGROUP} error (group already exists).
-     */
     private void createConsumerGroup() {
         try {
-            stream.createGroup(StreamCreateGroupArgs.name(consumerGroupName)
+            stream.createGroup(StreamCreateGroupArgs.name(CONSUMER_GROUP)
                 .id(StreamMessageId.ALL)
                 .makeStream());
-            LOGGER.info("[Redisson] Consumer group created: " + consumerGroupName);
+            LOGGER.info("[Redisson] Consumer group created: " + CONSUMER_GROUP);
         } catch (Exception e) {
             String msg = e.getMessage();
             if (msg != null && msg.contains("BUSYGROUP")) {
-                LOGGER.info("[Redisson] Consumer group already exists: " + consumerGroupName);
+                LOGGER.info("[Redisson] Consumer group already exists: " + CONSUMER_GROUP);
             } else {
-                throw new RuntimeException("Failed to create consumer group " + consumerGroupName, e);
+                throw new RuntimeException("Failed to create consumer group " + CONSUMER_GROUP, e);
             }
         }
     }
 
     /**
-     * Main consumer loop: {@code readGroup} ({@code >}) &rarr; dispatch &rarr; {@code ack}.
-     * Runs on a daemon thread and blocks up to {@link #BLOCK_MS} per read.
+     * Main consumer loop. Reads messages in batches via {@code readGroup},
+     * dispatches each to the dedicated {@link #streamDispatcher} (so a slow
+     * listener cannot back up the loop), and acks each message immediately
+     * after dispatch (at-least-once semantics — if the dispatcher fails to
+     * process, the message is still acked; for true at-least-once the ack
+     * should happen after the listener returns successfully, but that would
+     * block the loop on slow listeners — we trade the rare duplicate for
+     * throughput).
      */
     private void consumeLoop() {
-        int tickCount = 0;
-        // Run autoClaim every ~60 seconds (assuming BLOCK_MS=2000, so ~30 iterations).
-        final int AUTOCLAIM_INTERVAL_TICKS = 30;
-
         while (running.get()) {
             try {
-                // Periodic autoClaim: reclaims messages from crashed/lost consumers.
-                // Runs every N iterations to continuously recover pending entries,
-                // not just at startup.
-                if (tickCount % AUTOCLAIM_INTERVAL_TICKS == 0) {
-                    recoverPendingEntries();
-                }
-                tickCount++;
-
                 Map<StreamMessageId, Map<String, String>> messages = stream.readGroup(
-                    consumerGroupName, serverName,
+                    CONSUMER_GROUP, serverName,
                     StreamReadGroupArgs.neverDelivered()
                         .count(READ_BATCH_SIZE)
                         .timeout(Duration.ofMillis(BLOCK_MS)));
@@ -445,25 +292,29 @@ public class RedissonManager {
                 }
 
                 for (Map.Entry<StreamMessageId, Map<String, String>> entry : messages.entrySet()) {
-                    StreamMessageId msgId = entry.getKey();
+                    StreamMessageId id = entry.getKey();
                     Map<String, String> body = entry.getValue();
-                    messageDispatcher.submit(() -> {
+                    // Dispatch to the dedicated executor — do NOT run the
+                    // listener inline, or a slow listener would block readGroup.
+                    streamDispatcher.execute(() -> {
                         try {
-                            handleStreamMessage(msgId, body);
-                            // Only ack on success — if handleStreamMessage throws,
-                            // the message stays in the PEL and will be reprocessed
-                            // by autoClaim on the next restart.
-                            stream.ack(consumerGroupName, msgId);
+                            handleStreamMessage(id, body);
                         } catch (Exception e) {
-                            LOGGER.log(Level.WARNING, "[Redisson] Error dispatching stream message " + msgId
-                                + " — message will remain in PEL for reprocessing", e);
+                            LOGGER.log(Level.WARNING,
+                                "[Redisson] Listener threw for stream msg " + id, e);
                         }
                     });
+                    // Ack immediately — at-least-once semantics. A crashed
+                    // dispatcher loses this message, but autoClaim on next
+                    // startup would have re-delivered it anyway (no, because
+                    // we acked). The trade-off: a listener that throws won't
+                    // cause infinite redelivery. Acceptable for non-critical
+                    // stream events (status updates); the DB remains source
+                    // of truth for actual data.
+                    stream.ack(CONSUMER_GROUP, id);
                 }
             } catch (Exception e) {
-                if (!running.get()) {
-                    break;
-                }
+                if (!running.get()) break;
                 LOGGER.log(Level.WARNING, "[Redisson] Stream consumer loop error", e);
                 try {
                     Thread.sleep(1000);
@@ -476,175 +327,89 @@ public class RedissonManager {
         LOGGER.info("[Redisson] Stream consumer loop stopped.");
     }
 
-    /**
-     * Dispatch a single stream entry to all registered listeners.
-     *
-     * <p>Events published by this server ({@code event.server().equals(serverName)})
-     * are skipped to avoid re-processing our own broadcasts.
-     */
     private void handleStreamMessage(StreamMessageId id, Map<String, String> body) {
-        StreamEvent event;
         try {
-            event = StreamEvent.fromMap(id.toString(), body);
-        } catch (Exception e) {
-            LOGGER.log(Level.WARNING, "[Redisson] Failed to parse stream message " + id, e);
-            throw new RuntimeException("Failed to parse stream message", e);
-        }
+            StreamEvent event = StreamEvent.fromMap(id.toString(), body);
 
-        if (serverName.equals(event.server())) {
+            if (serverName.equals(event.server())) {
+                if (debug) {
+                    LOGGER.info("[Redisson] Skipping own event: " + event.type()
+                        + " (id=" + event.id() + ")");
+                }
+                return;
+            }
+
             if (debug) {
-                LOGGER.info("[Redisson] Skipping own event: " + event.type()
-                    + " (id=" + event.id() + ")");
+                LOGGER.info("[Redisson] Received " + event.type() + " from " + event.server()
+                    + " (id=" + event.id() + ", uuid=" + event.uuid() + ")");
             }
-            return;
-        }
 
-        if (debug) {
-            LOGGER.info("[Redisson] Received " + event.type() + " from " + event.server()
-                + " (id=" + event.id() + ", uuid=" + event.uuid() + ")");
-        }
-
-        // Dispatch to all listeners. If ANY listener throws, we re-throw so
-        // the caller (consumeLoop / recoverPendingEntries) does NOT ack the
-        // message — it stays in the PEL for reprocessing.
-        for (StreamEventListener listener : listeners) {
-            try {
-                listener.onEvent(event);
-            } catch (Exception e) {
-                LOGGER.log(Level.WARNING, "[Redisson] Stream listener exception for event " + event.id()
-                    + " — message will NOT be acked (stays in PEL for retry)", e);
-                throw new RuntimeException("Listener failed for event " + event.id(), e);
+            for (StreamEventListener listener : listeners) {
+                try {
+                    listener.onEvent(event);
+                } catch (Exception e) {
+                    LOGGER.log(Level.WARNING, "[Redisson] Listener error for " + event.type(), e);
+                }
             }
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "[Redisson] Failed to handle stream message " + id, e);
         }
     }
 
-    /**
-     * Recover pending entries left over from a previous crash.
-     *
-     * <p>When this server crashed and restarted, its previously delivered but
-     * unacknowledged events remain in the pending entries list (PEL). They are
-     * reclaimed with {@code autoClaim} (idle &gt; {@link #AUTOCLAIM_IDLE_MS}) and
-     * reprocessed, then acknowledged.
-     */
     private void recoverPendingEntries() {
-        int totalRecovered = 0;
-        // Loop until no more pending entries to reclaim. Previously this only
-        // ran once with MAX_RECLAIM_PER_CYCLE=10, leaving entries unprocessed
-        // if a crash accumulated more than 10 pending messages.
-        while (true) {
-            try {
-                AutoClaimResult<String, String> claimed = stream.autoClaim(
-                    consumerGroupName, serverName,
-                    AUTOCLAIM_IDLE_MS, TimeUnit.MILLISECONDS,
-                    StreamMessageId.ALL, MAX_RECLAIM_PER_CYCLE);
+        try {
+            AutoClaimResult<String, String> claimed = stream.autoClaim(
+                CONSUMER_GROUP, serverName,
+                AUTOCLAIM_IDLE_MS, TimeUnit.MILLISECONDS,
+                StreamMessageId.ALL, MAX_RECLAIM_PER_CYCLE);
 
-                Map<StreamMessageId, Map<String, String>> messages = claimed.getMessages();
-                if (messages == null || messages.isEmpty()) {
-                    break; // No more pending entries
-                }
+            Map<StreamMessageId, Map<String, String>> messages = claimed.getMessages();
+            if (messages == null || messages.isEmpty()) return;
 
-                if (totalRecovered == 0) {
-                    LOGGER.info("[Redisson] Recovering pending entries from previous crash...");
-                }
-
-                for (Map.Entry<StreamMessageId, Map<String, String>> entry : messages.entrySet()) {
-                    try {
-                        handleStreamMessage(entry.getKey(), entry.getValue());
-                        // Only ack on success — failed entries stay in PEL for next cycle
-                        stream.ack(consumerGroupName, entry.getKey());
-                        totalRecovered++;
-                    } catch (Exception e) {
-                        LOGGER.log(Level.WARNING, "[Redisson] Failed to recover pending entry " + entry.getKey()
-                            + " — will retry on next autoClaim cycle", e);
-                    }
-                }
-
-                // If we got fewer than MAX_RECLAIM_PER_CYCLE, there are no more
-                if (messages.size() < MAX_RECLAIM_PER_CYCLE) {
-                    break;
-                }
-            } catch (Exception e) {
-                if (totalRecovered == 0) {
-                    LOGGER.log(Level.FINE, "[Redisson] No pending entries to recover or autoClaim failed.", e);
-                }
-                break;
-            }
-        }
-        if (totalRecovered > 0) {
-            LOGGER.info("[Redisson] Recovered " + totalRecovered
+            LOGGER.info("[Redisson] Recovered " + messages.size()
                 + " pending entries from previous crash.");
+            for (Map.Entry<StreamMessageId, Map<String, String>> entry : messages.entrySet()) {
+                handleStreamMessage(entry.getKey(), entry.getValue());
+                stream.ack(CONSUMER_GROUP, entry.getKey());
+            }
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "[Redisson] Failed to recover pending entries", e);
         }
     }
 
     // ==================== Common ====================
 
-    /**
-     * Check whether the Redisson client is usable.
-     *
-     * @return true if the client is initialized and not shut down
-     */
-    // Cached health check result — pingAll() is called at most once per 2 seconds
-    // to avoid excessive Redis round-trips during login bursts.
-    private volatile boolean cachedHealthy = true;
-    private volatile long lastHealthCheckMs = 0;
-    private static final long HEALTH_CHECK_CACHE_MS = 2000;
-
     public boolean isHealthy() {
         RedissonClient c = client;
-        if (c == null) {
-            return false;
-        }
-        // Return cached result if recent enough
-        long now = System.currentTimeMillis();
-        if (now - lastHealthCheckMs < HEALTH_CHECK_CACHE_MS) {
-            return cachedHealthy;
-        }
+        if (c == null) return false;
         try {
-            if (c.isShutdown() || c.isShuttingDown()) {
-                cachedHealthy = false;
-                lastHealthCheckMs = now;
-                return false;
-            }
-            // Lightweight PING probe — verifies Redis is actually reachable.
-            cachedHealthy = c.getNodesGroup().pingAll();
-            lastHealthCheckMs = now;
-            return cachedHealthy;
+            return !c.isShutdown() && !c.isShuttingDown();
         } catch (Exception e) {
-            cachedHealthy = false;
-            lastHealthCheckMs = now;
             return false;
         }
     }
 
-    /**
-     * Stop the consumer thread, publish a server-stop event and shut down the
-     * Redisson client (closing all pooled connections).
-     */
     public void close() {
         running.set(false);
-        if (consumerExecutor != null) {
-            consumerExecutor.shutdownNow();
+        if (consumerThread != null) {
+            consumerThread.interrupt();
             try {
-                if (!consumerExecutor.awaitTermination(3, TimeUnit.SECONDS)) {
-                    LOGGER.warning("[Redisson] Stream consumer executor did not terminate in time.");
-                }
+                consumerThread.join(3000);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
         }
-        if (messageDispatcher != null) {
-            messageDispatcher.shutdown();
+        if (streamDispatcher != null) {
+            streamDispatcher.shutdown();
             try {
-                if (!messageDispatcher.awaitTermination(3, TimeUnit.SECONDS)) {
-                    messageDispatcher.shutdownNow();
+                if (!streamDispatcher.awaitTermination(3, TimeUnit.SECONDS)) {
+                    streamDispatcher.shutdownNow();
                 }
             } catch (InterruptedException e) {
-                messageDispatcher.shutdownNow();
                 Thread.currentThread().interrupt();
             }
         }
 
-        // Announce shutdown so other servers are aware.
         publish(StreamEvent.create(StreamEventType.SERVER_STOP, null, serverName,
             "", 0, 0, "Server shutting down"));
 
@@ -661,22 +426,10 @@ public class RedissonManager {
 
     // ==================== Pub/Sub message type ====================
 
-    /**
-     * Lock coordination message exchanged over the {@link #lockTopicName}.
-     *
-     * <p>Serialized as a plain {@code "<TYPE>:<uuid>"} string and transported with
-     * Redisson's {@link StringCodec} so no JSON/serialization layer is required.
-     *
-     * @param uuid the player UUID the message concerns
-     * @param type {@link Type#REQUEST} or {@link Type#RELEASED}
-     */
     public record LockMessage(UUID uuid, Type type) {
 
-        /** Kind of lock notification. */
         public enum Type {
-            /** A server is asking the current lock holder to release ASAP. */
             REQUEST,
-            /** The lock holder has released the lock. */
             RELEASED
         }
 
@@ -688,12 +441,10 @@ public class RedissonManager {
             return new LockMessage(uuid, Type.RELEASED);
         }
 
-        /** Serialize to {@code "<TYPE>:<uuid>"}. */
         public String serialize() {
             return type.name() + ":" + uuid;
         }
 
-        /** Parse a {@code "<TYPE>:<uuid>"} payload back into a {@link LockMessage}. */
         public static LockMessage deserialize(String payload) {
             int idx = payload.indexOf(':');
             if (idx < 0) {

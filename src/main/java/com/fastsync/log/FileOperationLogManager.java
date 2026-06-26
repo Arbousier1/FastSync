@@ -14,8 +14,6 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -87,14 +85,6 @@ public class FileOperationLogManager {
     /** Per-UUID monotonic sequence counter (session-scoped, starts at 0). */
     private final ConcurrentHashMap<UUID, AtomicLong> seqCounters = new ConcurrentHashMap<>();
 
-    /** Dedicated single-thread executor for async log appends.
-     *  Avoids polluting ForkJoinPool.commonPool() with I/O-bound work. */
-    private final ExecutorService appendExecutor = Executors.newSingleThreadExecutor(r -> {
-        Thread t = new Thread(r, "FastSync-OpLog-Writer");
-        t.setDaemon(true);
-        return t;
-    });
-
     private volatile boolean initialized = false;
     private volatile boolean closed = false;
 
@@ -144,7 +134,7 @@ public class FileOperationLogManager {
                 logger.log(Level.WARNING,
                     "[OpLog] Failed to append operation log for " + entry.uuid(), e);
             }
-        }, appendExecutor);
+        });
     }
 
     private void appendSync(OperationLog entry) throws IOException {
@@ -321,15 +311,6 @@ public class FileOperationLogManager {
 
     public void close() {
         closed = true;
-        appendExecutor.shutdown();
-        try {
-            if (!appendExecutor.awaitTermination(3, java.util.concurrent.TimeUnit.SECONDS)) {
-                appendExecutor.shutdownNow();
-            }
-        } catch (InterruptedException e) {
-            appendExecutor.shutdownNow();
-            Thread.currentThread().interrupt();
-        }
         appendLocks.clear();
         seqCounters.clear();
         logger.info("[OpLog] File operation log closed.");

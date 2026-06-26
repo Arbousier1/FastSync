@@ -203,30 +203,30 @@ public class FastSyncProxy {
      * Query all registered backend servers for their FastSync status.
      */
     public CompletableFuture<List<HandoffProtocol.StatusResponseData>> queryAllStatus() {
-        List<CompletableFuture<HandoffProtocol.StatusResponseData>> safeFutures = new ArrayList<>();
+        List<HandoffProtocol.StatusResponseData> results = new ArrayList<>();
+        List<CompletableFuture<HandoffProtocol.StatusResponseData>> futures = new ArrayList<>();
 
         for (RegisteredServer server : proxy.getAllServers()) {
             String name = server.getServerInfo().getName();
             CompletableFuture<HandoffProtocol.StatusResponseData> future = new CompletableFuture<>();
             pendingStatusQueries.put(name, future);
-            // Wrap each future with completeOnTimeout + exceptionally so that
-            // a single slow/unresponsive backend doesn't cause the entire
-            // allOf to fail. The wrapped future always completes (either with
-            // data or with null), so allOf never throws.
-            CompletableFuture<HandoffProtocol.StatusResponseData> safe =
-                future.completeOnTimeout(null, config.getStatusQueryTimeoutMs(), TimeUnit.MILLISECONDS)
-                     .exceptionally(ex -> null);
-            safeFutures.add(safe);
+            futures.add(future);
 
             server.sendPluginMessage(HANDOFF_CHANNEL, HandoffProtocol.encodeStatusQuery());
         }
 
+        // Combine all futures with timeout
         CompletableFuture<Void> all = CompletableFuture.allOf(
-            safeFutures.toArray(new CompletableFuture[0]));
+            futures.toArray(new CompletableFuture[0]));
+
+        // Add timeout for each future
+        for (var f : futures) {
+            f.orTimeout(config.getStatusQueryTimeoutMs(), TimeUnit.MILLISECONDS)
+             .exceptionally(ex -> null);
+        }
 
         return all.thenApply(v -> {
-            List<HandoffProtocol.StatusResponseData> results = new ArrayList<>();
-            for (var f : safeFutures) {
+            for (var f : futures) {
                 HandoffProtocol.StatusResponseData data = f.join();
                 if (data != null) results.add(data);
             }
@@ -242,11 +242,6 @@ public class FastSyncProxy {
     @Subscribe
     public void onPluginMessage(PluginMessageEvent event) {
         if (!event.getIdentifier().equals(HANDOFF_CHANNEL)) return;
-
-        // Mark as handled so Velocity does not forward the internal protocol
-        // message to the player's client. Without this, Velocity's default
-        // behavior is to forward plugin messages.
-        event.setResult(PluginMessageEvent.ForwardResult.handled());
 
         byte[] data = event.getData();
         int type = HandoffProtocol.getMessageType(data);
@@ -279,7 +274,9 @@ public class FastSyncProxy {
             }
         }
 
-        // Message has been handled — not forwarded to the client.
+        // Note: We don't forward the message to the player client.
+        // Velocity's default is to forward, but our messages are internal
+        // protocol messages not meant for the client.
     }
 
     // ==================== Utility ====================

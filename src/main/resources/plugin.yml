@@ -1,7 +1,7 @@
 name: FastSync
 version: '${project.version}'
 main: com.fastsync.FastSync
-api-version: '1.21'
+api-version: '1.21.11'
 folia-supported: true
 authors: [FastSync]
 description: High-performance cross-server player data synchronization using NBT byte[] serialization with LZ4 compression
@@ -19,7 +19,7 @@ libraries:
 commands:
   fastsync:
     description: FastSync admin command
-    usage: /fastsync <reload|status|debug|saveall|log>
+    usage: /fastsync <reload|status|debug|saveall>
     permission: fastsync.admin
     aliases: [fsync, fs]
 
