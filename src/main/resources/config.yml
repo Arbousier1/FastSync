@@ -25,7 +25,8 @@ database:
   # Connection pool (HikariCP) settings
   pool-size: 10
   # Max tasks pending in the async executor queue (prevents OOM under login storms).
-  # When full, CallerRunsPolicy runs the task on the calling thread (backpressure).
+  # When full, AbortPolicy throws RejectedExecutionException.
+  # Quit saves fall back to synchronous execution; periodic saves are skipped (coalesced).
   queue-capacity: 256
   connection-timeout: 10000
   idle-timeout: 300000
@@ -135,7 +136,9 @@ sync:
   save-on-death: false
 
   # Save on world save
-  save-on-world-save: true
+  # Disabled by default — world saves fire frequently (every 5 min) and cause
+  # unnecessary DB write load. Enable only if you need extra crash durability.
+  save-on-world-save: false
 
   # Cancel commands while player data is loading
   cancel-commands-while-locked: false
@@ -145,11 +148,14 @@ sync:
 # ------------------------------------------------------------
 # Controls how custom PersistentDataContainer data is synchronized.
 #   off              - No PDC sync
-#   safe-all-paper   - (default) Use Paper's public serializeToBytes() API.
-#                      Safe, no reflection. Requires Paper 1.21.11+.
-#   registered-only  - Only sync keys explicitly listed in registered-keys below.
+#   safe-all-paper   - Use Paper's serializeToBytes() API via reflection.
+#                      Safe, no reflection of internal classes. Works on
+#                      Paper 1.21.11+ (public API) and older versions (package-
+#                      private methods via reflection, still safe).
+#   registered-only  - (default) Only sync keys explicitly listed in registered-keys below.
 #                      Production recommended: avoids syncing plugin-internal data.
-#   unsafe-reflection - Use reflection to access package-private methods.
+#                      Uses stable Bukkit API, compatible with all Paper versions.
+#   unsafe-reflection - Use reflection to access NMS internals.
 #                      Fallback for older Paper versions. Requires explicit
 #                      confirmation (unsafe-reflection.enabled: true).
 pdc:

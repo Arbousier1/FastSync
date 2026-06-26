@@ -385,43 +385,28 @@ public class DatabaseManager {
     }
 
     /**
-     * Save player data with optimistic concurrency control AND fencing token verification.
+     * Save player data AND RELEASE the lock (quit/final save).
      *
-     * <p>This implements two layers of defence against stale writes:
-     *
+     * <p>This is the <b>final save</b> path (player quit / shutdown). After a
+     * successful write the lock is cleared ({@code locked_by = NULL}) so another
+     * server can immediately acquire it. Uses triple CAS:
      * <ol>
-     *   <li><b>Version check (Dynamo-style):</b> {@code WHERE version = expectedVersion}
-     *       ensures the row hasn't been modified since we loaded it.
-     *
-     *   <li><b>Fencing token check (Kleppmann/ZooKeeper-style):</b>
-     *       {@code WHERE fencing_token <= fencingToken} ensures that even if the
-     *       version somehow matches (e.g. row was reset), a stale lock holder
-     *       whose fencing token is less than the current stored value cannot
-     *       overwrite data written by a newer lock holder.
+     *   <li>{@code version = expectedVersion} — optimistic concurrency</li>
+     *   <li>{@code fencing_token = fencingToken} — stale-write defence (Kleppmann)</li>
+     *   <li>{@code locked_by = serverName} — writer currently holds the DB lock</li>
      * </ol>
      *
-     * <p>The fencing token defence is critical: it handles the case where a server
-     * acquires lock (token 33), pauses for GC, lease expires, another server
-     * acquires lock (token 34) and writes, then the first server resumes and
-     * tries to write with its stale token 33. The DB rejects: 33 < 34.
-     *
-     * @param uuid          player UUID
-     * @param data          compressed data blob
-     * @param checksum      CRC32 checksum of the uncompressed data
+     * @param uuid            player UUID
+     * @param data            compressed data blob
+     * @param checksum        CRC32 checksum of the uncompressed data
      * @param expectedVersion the version this data was loaded from
-     * @param fencingToken  the fencing token assigned when the lock was acquired
-     * @param serverName    server writing the data
+     * @param fencingToken    the fencing token assigned when the lock was acquired
+     * @param serverName      server writing the data
      * @return true if saved successfully, false if version conflict or fencing token violation
      */
-    public boolean saveData(UUID uuid, byte[] data, long checksum, long expectedVersion,
-                            long fencingToken, String serverName) throws SQLException {
+    public boolean saveDataAndReleaseLock(UUID uuid, byte[] data, long checksum, long expectedVersion,
+                                          long fencingToken, String serverName) throws SQLException {
         long now = System.currentTimeMillis();
-        // Triple CAS: version + fencing_token + locked_by
-        // - version = expectedVersion: optimistic concurrency (row not modified since load)
-        // - fencing_token = fencingToken: the writer's lock is exactly this one
-        //   (a newer lock holder would have a different stored fencing_token, rejecting us)
-        // - locked_by = serverName: the writer currently holds the DB lock
-        //   (prevents writes after lock release due to logic bugs or races)
         try (Connection conn = dataSource.getConnection()) {
             return dsl(conn).update(playerData)
                 .set(DATA_FIELD, data)
@@ -437,6 +422,57 @@ public class DatabaseManager {
                     .and(LOCKED_BY_FIELD.eq(serverName)))
                 .execute() > 0;
         }
+    }
+
+    /**
+     * Save player data AND KEEP the lock (online/periodic/bulk save).
+     *
+     * <p>This is the <b>online save</b> path (periodic save, world-save, bulk
+     * save). The player is still online on this server, so the lock MUST be
+     * retained after the write. We refresh {@code locked_at} to prevent the
+     * lock from appearing stale while the player is actively playing.
+     *
+     * <p>Uses the same triple CAS as {@link #saveDataAndReleaseLock} but keeps
+     * {@code locked_by} and refreshes {@code locked_at} instead of clearing them.
+     *
+     * @param uuid            player UUID
+     * @param data            compressed data blob
+     * @param checksum        CRC32 checksum of the uncompressed data
+     * @param expectedVersion the version this data was loaded from
+     * @param fencingToken    the fencing token assigned when the lock was acquired
+     * @param serverName      server writing the data
+     * @return true if saved successfully, false if version conflict or fencing token violation
+     */
+    public boolean saveDataKeepLock(UUID uuid, byte[] data, long checksum, long expectedVersion,
+                                    long fencingToken, String serverName) throws SQLException {
+        long now = System.currentTimeMillis();
+        try (Connection conn = dataSource.getConnection()) {
+            return dsl(conn).update(playerData)
+                .set(DATA_FIELD, data)
+                .set(VERSION_FIELD, VERSION_FIELD.plus(1))
+                .set(CHECKSUM_FIELD, checksum)
+                .set(LAST_SERVER_FIELD, serverName)
+                .set(LAST_UPDATED_FIELD, now)
+                .set(LOCKED_AT_FIELD, now)  // refresh lock timestamp while player is online
+                // locked_by is NOT cleared — we still hold the lock
+                .where(UUID_FIELD.eq(uuid.toString())
+                    .and(VERSION_FIELD.eq(expectedVersion))
+                    .and(FENCING_TOKEN_FIELD.eq(fencingToken))
+                    .and(LOCKED_BY_FIELD.eq(serverName)))
+                .execute() > 0;
+        }
+    }
+
+    /**
+     * Save player data and release the lock (legacy/backward-compatible alias).
+     *
+     * @deprecated Use {@link #saveDataAndReleaseLock} for quit saves or
+     *             {@link #saveDataKeepLock} for online/periodic saves.
+     */
+    @Deprecated
+    public boolean saveData(UUID uuid, byte[] data, long checksum, long expectedVersion,
+                            long fencingToken, String serverName) throws SQLException {
+        return saveDataAndReleaseLock(uuid, data, checksum, expectedVersion, fencingToken, serverName);
     }
 
     /**

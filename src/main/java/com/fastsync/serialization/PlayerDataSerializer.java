@@ -230,19 +230,32 @@ public class PlayerDataSerializer {
         playerData.setTotalExperience(root.getInt("totalExperience"));
 
         // Extra
-        int gmOrdinal = root.getByte("gameMode") & 0xFF;
-        GameMode[] gameModes = GameMode.values();
-        // Try name-based deserialization first (current format)
+        // Try name-based deserialization first (current format: gameMode stored as STRING)
+        GameMode gameMode = GameMode.SURVIVAL;
         try {
-            playerData.setGameMode(GameMode.valueOf(root.getString("gameMode")));
+            String gmName = root.getString("gameMode");
+            if (gmName != null && !gmName.isEmpty()) {
+                gameMode = GameMode.valueOf(gmName);
+            }
         } catch (Exception nameEx) {
-            // Fallback: legacy ordinal-based format (for data saved by older versions)
+            // Fallback: legacy ordinal-based format (for data saved by older versions).
+            // The old format stored gameMode as a BYTE (ordinal). We need to check
+            // the tag type before reading as byte to avoid exceptions when the tag
+            // is actually a STRING (current format).
             try {
-                playerData.setGameMode(gmOrdinal < gameModes.length ? gameModes[gmOrdinal] : GameMode.SURVIVAL);
+                Tag gmTag = root.get("gameMode");
+                if (gmTag instanceof net.momirealms.sparrow.nbt.ByteTag byteTag) {
+                    int gmOrdinal = byteTag.getAsByte() & 0xFF;
+                    GameMode[] gameModes = GameMode.values();
+                    if (gmOrdinal >= 0 && gmOrdinal < gameModes.length) {
+                        gameMode = gameModes[gmOrdinal];
+                    }
+                }
             } catch (Exception ordEx) {
-                playerData.setGameMode(GameMode.SURVIVAL);
+                // Keep SURVIVAL default
             }
         }
+        playerData.setGameMode(gameMode);
         playerData.setFireTicks(root.getInt("fireTicks"));
         playerData.setRemainingAir(root.getInt("remainingAir"));
         playerData.setMaximumAir(root.getInt("maximumAir"));

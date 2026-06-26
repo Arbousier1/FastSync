@@ -12,6 +12,7 @@ import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 
 import java.util.UUID;
+import java.util.logging.Level;
 
 /**
  * Player event listener for synchronization.
@@ -83,15 +84,40 @@ public class PlayerListener implements Listener {
      * Collect and save player data when the player quits.
      * Uses HIGHEST priority so other plugins can process quit first.
      *
-     * <p>On Folia, Bukkit API (inventory, health, stats) must be read on the
-     * player's entity region thread. PlayerQuitEvent may not guarantee this,
-     * so we dispatch via entity scheduler.
+     * <p><b>Folia safety:</b> Bukkit API (inventory, health, stats) must be read
+     * on the player's entity region thread. We dispatch via entity scheduler
+     * with a {@code retired} callback that handles the case where the entity
+     * is no longer valid (e.g., during server shutdown when the entity is
+     * retired before our callback runs). In that case, we attempt a
+     * synchronous best-effort save as a fallback — losing the final state
+     * is unacceptable even if the entity scheduler is unavailable.
      */
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onQuit(PlayerQuitEvent event) {
         var player = event.getPlayer();
-        SchedulerUtil.runAtEntity(plugin, player, () ->
-            syncManager.collectAndSavePlayerData(player)
-        , null);
+        UUID uuid = player.getUniqueId();
+
+        SchedulerUtil.runAtEntity(plugin, player, () -> {
+            // Normal case: entity is still valid, collect and save on region thread
+            syncManager.collectAndSavePlayerData(player);
+        }, () -> {
+            // Retired callback: entity no longer valid (player despawned, server shutting down).
+            // This can happen on Folia during shutdown when the entity scheduler
+            // retires entities before all pending tasks run.
+            //
+            // We MUST NOT silently lose the final save. Attempt a best-effort
+            // synchronous collection. On Paper (non-Folia) the Bukkit API is
+            // thread-safe for reads from the main thread during quit; on Folia
+            // during shutdown the region threads are being torn down, so this
+            // is our last chance to read player state.
+            plugin.getLogger().log(Level.WARNING,
+                "Entity retired for " + uuid + " during quit — attempting synchronous fallback save");
+            try {
+                syncManager.collectAndSavePlayerDataSync(player);
+            } catch (Exception e) {
+                plugin.getLogger().log(Level.SEVERE,
+                    "Synchronous fallback save failed for " + uuid, e);
+            }
+        });
     }
 }

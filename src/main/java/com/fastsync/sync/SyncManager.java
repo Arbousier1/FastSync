@@ -665,19 +665,30 @@ public class SyncManager {
             playerFencingTokens.remove(uuid);
             // Release lock without saving
             pendingSaveCount.incrementAndGet();
-            asyncExecutor.execute(() -> {
+            try {
+                asyncExecutor.execute(() -> {
+                    try {
+                        databaseManager.releaseLock(uuid, config.getServerName());
+                        notifyLockReleased(uuid);
+                        if (config.isDebug()) {
+                            logger.info("Released lock for " + uuid + " (never joined)");
+                        }
+                    } catch (SQLException e) {
+                        logger.log(Level.WARNING, "Failed to release lock for " + uuid, e);
+                    } finally {
+                        pendingSaveCount.decrementAndGet();
+                    }
+                });
+            } catch (java.util.concurrent.RejectedExecutionException e) {
+                // Executor shut down — release lock synchronously
+                pendingSaveCount.decrementAndGet();
                 try {
                     databaseManager.releaseLock(uuid, config.getServerName());
                     notifyLockReleased(uuid);
-                    if (config.isDebug()) {
-                        logger.info("Released lock for " + uuid + " (never joined)");
-                    }
-                } catch (SQLException e) {
-                    logger.log(Level.WARNING, "Failed to release lock for " + uuid, e);
-                } finally {
-                    pendingSaveCount.decrementAndGet();
+                } catch (SQLException ex) {
+                    logger.log(Level.WARNING, "Failed to release lock for " + uuid + " (sync fallback)", ex);
                 }
-            });
+            }
             return;
         }
 
@@ -729,6 +740,79 @@ public class SyncManager {
                 playerFencingTokens.remove(uuid);
                 pendingSaveCount.decrementAndGet();
             }
+        }
+    }
+
+    /**
+     * Collect and save player data synchronously (fallback for retired entities).
+     *
+     * <p>This is called from the {@code retired} callback of
+     * {@link SchedulerUtil#runAtEntity} when the entity scheduler can no longer
+     * run tasks on the player's region thread (typically during Folia shutdown).
+     * It performs a best-effort synchronous collection and save on the calling
+     * thread, bypassing the async executor. This is a last-resort mechanism to
+     * prevent silent data loss when the normal async save path is unavailable.
+     *
+     * <p><b>Thread safety note:</b> This method may be called from threads where
+     * the Bukkit API is not fully safe. On Paper/Spigot during PlayerQuitEvent,
+     * the main thread is acceptable for reading player state. On Folia during
+     * shutdown, region threads are being torn down, so reads may fail with
+     * exceptions — those are caught and logged, and a lock release is still
+     * attempted to avoid stranding locks.
+     */
+    public void collectAndSavePlayerDataSync(Player player) {
+        UUID uuid = player.getUniqueId();
+
+        // Check if player has pending data (was kicked during pre-login, never joined)
+        if (pendingData.containsKey(uuid) || pendingEmptyData.contains(uuid)) {
+            pendingData.remove(uuid);
+            pendingEmptyData.remove(uuid);
+            pendingLoadTimes.remove(uuid);
+            activePlayers.remove(uuid);
+            playerVersions.remove(uuid);
+            playerFencingTokens.remove(uuid);
+            try {
+                databaseManager.releaseLock(uuid, config.getServerName());
+                notifyLockReleased(uuid);
+                logger.info("Released lock for " + uuid + " (never joined, sync fallback)");
+            } catch (SQLException e) {
+                logger.log(Level.WARNING, "Failed to release lock for " + uuid, e);
+            }
+            return;
+        }
+
+        // Best-effort data collection
+        PlayerData data;
+        try {
+            data = collectPlayerData(player);
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Failed to collect data for " + uuid
+                + " in sync fallback — releasing lock without saving", e);
+            activePlayers.remove(uuid);
+            playerVersions.remove(uuid);
+            playerFencingTokens.remove(uuid);
+            try {
+                databaseManager.releaseLock(uuid, config.getServerName());
+                notifyLockReleased(uuid);
+            } catch (SQLException ex) {
+                logger.log(Level.WARNING, "Failed to release lock after sync collection failure for " + uuid, ex);
+            }
+            return;
+        }
+
+        activePlayers.remove(uuid);
+
+        // Save synchronously with per-UUID lock to avoid races with any in-flight save
+        java.util.concurrent.locks.ReentrantLock saveLock =
+            playerSaveLocks.computeIfAbsent(uuid, k -> new java.util.concurrent.locks.ReentrantLock());
+        saveLock.lock();
+        try {
+            persistCollectedData(uuid, data, SaveKind.QUIT);
+        } finally {
+            saveLock.unlock();
+            playerSaveLocks.remove(uuid, saveLock);
+            playerVersions.remove(uuid);
+            playerFencingTokens.remove(uuid);
         }
     }
 
@@ -989,59 +1073,6 @@ public class SyncManager {
         }
     }
 
-    private void collectPDC(Player player, PlayerData data) {
-        try {
-            org.bukkit.persistence.PersistentDataContainer pdc = player.getPersistentDataContainer();
-            if (pdc == null || pdc.isEmpty()) {
-                data.setPersistentDataContainer(new HashMap<>());
-                return;
-            }
-            java.lang.reflect.Method serialize = findMethod(pdc.getClass(), "serializeToBytes");
-            if (serialize == null) {
-                if (config.isDebug()) {
-                    logger.fine("[PDC] serializeToBytes not found on " + pdc.getClass().getName() + ", PDC sync disabled");
-                }
-                data.setPersistentDataContainer(new HashMap<>());
-                return;
-            }
-            serialize.setAccessible(true);
-            byte[] bytes = (byte[]) serialize.invoke(pdc);
-            if (bytes != null && bytes.length > 0) {
-                Map<String, byte[]> pdcMap = new HashMap<>();
-                pdcMap.put("__pdc_bytes__", bytes);
-                data.setPersistentDataContainer(pdcMap);
-            } else {
-                data.setPersistentDataContainer(new HashMap<>());
-            }
-        } catch (Exception e) {
-            if (config.isDebug()) {
-                logger.warning("Failed to collect PDC: " + e.getMessage());
-            }
-            data.setPersistentDataContainer(new HashMap<>());
-        }
-    }
-
-    /**
-     * Walk the class hierarchy (including superclasses) to find a declared
-     * method by name, even if it is package-private or protected.
-     *
-     * <p>{@code Class.getMethod()} only finds public methods, which fails for
-     * Paper's {@code CraftPersistentDataContainer#serializeToBytes()} when it
-     * is package-private on certain versions. This method uses
-     * {@code getDeclaredMethod()} on each class in the hierarchy.
-     */
-    private static java.lang.reflect.Method findMethod(Class<?> clazz, String name, Class<?>... paramTypes) {
-        Class<?> c = clazz;
-        while (c != null && c != Object.class) {
-            try {
-                return c.getDeclaredMethod(name, paramTypes);
-            } catch (NoSuchMethodException ignored) {
-                c = c.getSuperclass();
-            }
-        }
-        return null;
-    }
-
     // ==================== Data Apply Helpers ====================
 
     @SuppressWarnings("deprecation")
@@ -1184,33 +1215,6 @@ public class SyncManager {
         }
     }
 
-    private void applyPDC(Player player, PlayerData data) {
-        // Restore the player's PersistentDataContainer from the serialized bytes
-        // captured by collectPDC(). Uses reflection to call CraftBukkit/Paper's
-        // deserializeBytes(byte[]) on the implementation class.
-        if (data.getPersistentDataContainer() == null || data.getPersistentDataContainer().isEmpty()) {
-            return;
-        }
-        byte[] pdcBytes = data.getPersistentDataContainer().get("__pdc_bytes__");
-        if (pdcBytes == null) {
-            return;
-        }
-        try {
-            org.bukkit.persistence.PersistentDataContainer pdc = player.getPersistentDataContainer();
-            java.lang.reflect.Method deserialize = findMethod(pdc.getClass(), "deserializeBytes", byte[].class);
-            if (deserialize == null) {
-                if (config.isDebug()) {
-                    logger.fine("[PDC] deserializeBytes not found on " + pdc.getClass().getName());
-                }
-                return;
-            }
-            deserialize.setAccessible(true);
-            deserialize.invoke(pdc, pdcBytes);
-        } catch (Exception e) {
-            if (config.isDebug()) logger.warning("Failed to apply PDC: " + e.getMessage());
-        }
-    }
-
     // ==================== Periodic Save ====================
 
     /**
@@ -1254,23 +1258,30 @@ public class SyncManager {
                     // Use per-UUID lock to serialize with any in-flight periodic/quit save
                     java.util.concurrent.locks.ReentrantLock saveLock =
                         playerSaveLocks.computeIfAbsent(uuid, k -> new java.util.concurrent.locks.ReentrantLock());
-                    asyncExecutor.execute(() -> {
-                        SaveResult result;
-                        try {
-                            saveLock.lock();
+                    try {
+                        asyncExecutor.execute(() -> {
+                            SaveResult result;
                             try {
-                                result = persistCollectedData(uuid, data, SaveKind.BULK);
+                                saveLock.lock();
+                                try {
+                                    result = persistCollectedData(uuid, data, SaveKind.BULK);
+                                } finally {
+                                    saveLock.unlock();
+                                    playerSaveLocks.remove(uuid, saveLock);
+                                }
+                            } catch (Exception e) {
+                                result = SaveResult.error(e.getMessage());
                             } finally {
-                                saveLock.unlock();
-                                playerSaveLocks.remove(uuid, saveLock);
+                                pendingSaveCount.decrementAndGet();
                             }
-                        } catch (Exception e) {
-                            result = SaveResult.error(e.getMessage());
-                        } finally {
-                            pendingSaveCount.decrementAndGet();
-                        }
-                        future.complete(result);
-                    });
+                            future.complete(result);
+                        });
+                    } catch (java.util.concurrent.RejectedExecutionException e) {
+                        // Queue full during bulk save — record failure, don't block wait loop
+                        pendingSaveCount.decrementAndGet();
+                        logger.log(Level.WARNING, "Async queue full during bulk save for " + uuid, e);
+                        future.complete(SaveResult.error("async queue full"));
+                    }
                 } catch (Exception e) {
                     logger.log(Level.SEVERE, "Failed to collect data for " + uuid + " during bulk save", e);
                     future.complete(SaveResult.error(e.getMessage()));
@@ -1307,23 +1318,29 @@ public class SyncManager {
     }
 
     /**
-     * Save a single player's data asynchronously (for periodic saves).
-     */
-    /**
-     * Save a single player's data asynchronously (for periodic saves).
+     * Save a single player's data asynchronously (for periodic/death/world_save saves).
      *
      * <p><b>Folia compatibility:</b> On Folia, {@code collectPlayerData} must run
      * on the entity's region thread, not the global region thread. We dispatch
      * the data collection via {@link SchedulerUtil#runAtEntity}, then perform
      * the async DB save from the collected data.
+     *
+     * @param player the player to save
+     * @param kind   the save kind (PERIODIC, DEATH, WORLD_SAVE — all online/keep-lock)
      */
-    public void savePlayerAsync(Player player) {
+    public void savePlayerAsync(Player player, SaveKind kind) {
         if (!activePlayers.containsKey(player.getUniqueId())) {
+            return;
+        }
+        // Only online-save kinds are valid here; QUIT is handled by collectAndSavePlayerData
+        if (kind.releaseLock) {
+            logger.warning("savePlayerAsync called with release-lock kind " + kind + " — use collectAndSavePlayerData for quit saves");
             return;
         }
 
         UUID uuid = player.getUniqueId();
         Plugin plugin = JavaPlugin.getPlugin(FastSync.class);
+        final SaveKind finalKind = kind;
 
         // Collect player data on the entity's region thread (Folia-safe)
         SchedulerUtil.runAtEntity(plugin, player, () -> {
@@ -1332,33 +1349,49 @@ public class SyncManager {
             pendingSaveCount.incrementAndGet();
             java.util.concurrent.locks.ReentrantLock saveLock =
                 playerSaveLocks.computeIfAbsent(uuid, k -> new java.util.concurrent.locks.ReentrantLock());
-            asyncExecutor.execute(() -> {
-                // Periodic save: skip if a save is already in progress for this player.
-                // The next periodic tick will pick up the latest data — coalescing
-                // avoids unnecessary version conflicts and saves CPU/DB load.
-                if (!saveLock.tryLock()) {
-                    pendingSaveCount.decrementAndGet();
-                    if (config.isDebug()) {
-                        logger.fine("Skipping periodic save for " + uuid + " — save already in progress");
+            try {
+                asyncExecutor.execute(() -> {
+                    // Online save: skip if a save is already in progress for this player.
+                    // The next periodic tick will pick up the latest data — coalescing
+                    // avoids unnecessary version conflicts and saves CPU/DB load.
+                    if (!saveLock.tryLock()) {
+                        pendingSaveCount.decrementAndGet();
+                        if (config.isDebug()) {
+                            logger.fine("Skipping " + finalKind + " save for " + uuid + " — save already in progress");
+                        }
+                        return;
                     }
-                    return;
+                    try {
+                        persistCollectedData(uuid, data, finalKind);
+                    } catch (Exception e) {
+                        logger.log(Level.WARNING, finalKind + " save failed for " + uuid, e);
+                    } finally {
+                        saveLock.unlock();
+                        playerSaveLocks.remove(uuid, saveLock);
+                        pendingSaveCount.decrementAndGet();
+                    }
+            });
+            } catch (java.util.concurrent.RejectedExecutionException e) {
+                // Queue full — online save can be skipped (coalesced to next tick).
+                // The player is still online; quit save will persist final state.
+                pendingSaveCount.decrementAndGet();
+                if (config.isDebug()) {
+                    logger.fine("Skipping " + finalKind + " save for " + uuid + " — async queue full");
                 }
-                try {
-                    persistCollectedData(uuid, data, SaveKind.PERIODIC);
-                } catch (Exception e) {
-                    logger.log(Level.WARNING, "Periodic save failed for " + uuid, e);
-                } finally {
-                    saveLock.unlock();
-                    playerSaveLocks.remove(uuid, saveLock);
-                    pendingSaveCount.decrementAndGet();
-                }
-        });
+            }
         }, () -> {
-            // retired callback: entity no longer valid (player logged out during periodic save tick)
+            // retired callback: entity no longer valid (player logged out during save tick)
             if (config.isDebug()) {
-                logger.fine("Periodic save skipped for " + uuid + " — entity retired (player offline?)");
+                logger.fine(finalKind + " save skipped for " + uuid + " — entity retired (player offline?)");
             }
         });
+    }
+
+    /**
+     * Save a single player's data asynchronously (periodic save default).
+     */
+    public void savePlayerAsync(Player player) {
+        savePlayerAsync(player, SaveKind.PERIODIC);
     }
 
     // ==================== Cleanup ====================
@@ -1443,7 +1476,26 @@ public class SyncManager {
     // ==================== Unified Save Path ====================
 
     /** Save kind for logging and behavior differentiation. */
-    private enum SaveKind { QUIT, PERIODIC, BULK }
+    public enum SaveKind {
+        /** Player quit / final save — lock released after save. */
+        QUIT("disconnect", true),
+        /** Periodic online save — lock kept, data refreshed. */
+        PERIODIC("periodic", false),
+        /** Bulk save (shutdown / /saveall) — for shutdown this is final, but online players keep lock. */
+        BULK("bulk", false),
+        /** World-save triggered save — online save, lock kept. */
+        WORLD_SAVE("world_save", false),
+        /** Death-triggered save — online save, lock kept. */
+        DEATH("death", false);
+
+        final String causeName;
+        final boolean releaseLock;
+
+        SaveKind(String causeName, boolean releaseLock) {
+            this.causeName = causeName;
+            this.releaseLock = releaseLock;
+        }
+    }
 
     /** Result of a save operation. */
     public record SaveResult(boolean success, long expectedVersion, long actualVersion, int compressedSize, String errorMessage) {
@@ -1461,16 +1513,26 @@ public class SyncManager {
     /**
      * Unified save path: serialize → compress → checksum → DB CAS → conflict/advance/lock-release.
      *
-     * <p>All three save paths (quit, periodic, bulk) converge here to prevent
+     * <p>All save paths (quit, periodic, bulk, world_save, death) converge here to prevent
      * "fix one, forget the other" drift. The caller is responsible for:
      * <ul>
      *   <li>Per-UUID locking (quit: lock+wait, periodic: tryLock+skip)</li>
      *   <li>pendingSaveCount management</li>
      *   <li>playerVersions/playerFencingTokens cleanup (quit only)</li>
      * </ul>
+     *
+     * <p>Lock semantics are determined by {@link SaveKind#releaseLock}:
+     * <ul>
+     *   <li>{@code releaseLock=true} (QUIT): after save, lock is released and Redis notified.</li>
+     *   <li>{@code releaseLock=false} (PERIODIC/BULK/WORLD_SAVE/DEATH): lock is kept,
+     *       {@code locked_at} refreshed. No Redis notification — other servers should not
+     *       attempt to acquire the lock while the player is still online on this server.</li>
+     * </ul>
      */
     private SaveResult persistCollectedData(UUID uuid, PlayerData data, SaveKind kind) {
         long startTime = System.nanoTime();
+        // Set save cause for snapshot trigger matching and audit logging
+        data.setSaveCause(kind.causeName);
         try {
             // 1. Serialize
             byte[] serialized = PlayerDataSerializer.serialize(data);
@@ -1491,12 +1553,21 @@ public class SyncManager {
             long expectedVersion = data.getVersion();
             long fencingToken = data.getFencingToken();
             long saveStart = System.nanoTime();
-            boolean saved = databaseManager.saveData(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
+
+            boolean saved;
+            if (kind.releaseLock) {
+                // Final save (quit): release lock after successful write
+                saved = databaseManager.saveDataAndReleaseLock(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
+            } else {
+                // Online save (periodic/bulk/world_save/death): keep lock, refresh locked_at
+                saved = databaseManager.saveDataKeepLock(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
+            }
+
             long saveElapsedMs = (System.nanoTime() - saveStart) / 1_000_000;
             if (saveLatency != null) saveLatency.record(saveElapsedMs);
 
             if (!saved) {
-                // 5a. Conflict: release lock + log + conflict snapshot
+                // 5a. Conflict
                 long actualVersion = databaseManager.getCurrentVersion(uuid);
                 long actualFencingToken = databaseManager.getCurrentFencingToken(uuid);
                 conflictManager.handleConflict(uuid, data, expectedVersion, actualVersion);
@@ -1510,12 +1581,25 @@ public class SyncManager {
 
                 if (saveLatency != null) saveLatency.recordError();
 
-                try {
-                    databaseManager.releaseLock(uuid, config.getServerName());
-                } catch (SQLException lockEx) {
-                    logger.log(Level.WARNING, "Failed to release lock after " + kind + " conflict for " + uuid, lockEx);
+                if (kind.releaseLock) {
+                    // Quit save: release lock even on conflict — player is leaving
+                    try {
+                        databaseManager.releaseLock(uuid, config.getServerName());
+                    } catch (SQLException lockEx) {
+                        logger.log(Level.WARNING, "Failed to release lock after " + kind + " conflict for " + uuid, lockEx);
+                    }
+                    notifyLockReleased(uuid);
                 }
-                notifyLockReleased(uuid);
+                // Online save: do NOT release lock — player is still on this server.
+                // The CAS failure means someone else wrote (fencing token violation),
+                // which is a serious bug. Log it at SEVERE and keep the lock.
+                if (!kind.releaseLock) {
+                    logger.log(Level.SEVERE, "[Fencing] Online save conflict for " + uuid
+                        + " — possible lock infringement! The lock should be held by us but CAS failed."
+                        + " expected v" + expectedVersion + "/ft" + fencingToken
+                        + ", actual v" + actualVersion + "/ft" + actualFencingToken);
+                }
+
                 return SaveResult.conflict(expectedVersion, actualVersion, compressed.length);
             } else {
                 // 5b. Success: advance version + log + snapshot + publish
@@ -1529,13 +1613,17 @@ public class SyncManager {
                 logOperation(uuid, OperationType.SAVE, fencingToken, expectedVersion + 1,
                     compressed.length, kind + " saved v" + (expectedVersion + 1) + " cause=" + data.getSaveCause());
 
-                publishCheckout(uuid, expectedVersion + 1, fencingToken, data.getSaveCause());
-
-                notifyLockReleased(uuid);
+                if (kind.releaseLock) {
+                    // Quit save: publish checkout event and notify waiting servers
+                    publishCheckout(uuid, expectedVersion + 1, fencingToken, data.getSaveCause());
+                    notifyLockReleased(uuid);
+                }
+                // Online save: do NOT publish checkout or notify — lock is still held by us.
+                // Other servers should not try to acquire the lock while player is online here.
 
                 if (config.isDebug()) {
                     logger.info(kind + " save for " + uuid + " (v" + expectedVersion + "->v" + (expectedVersion + 1)
-                        + ", " + compressed.length + " bytes)");
+                        + ", " + compressed.length + " bytes, lock=" + (kind.releaseLock ? "released" : "kept") + ")");
                 }
 
                 if (config.isLogTiming()) {
@@ -1547,13 +1635,17 @@ public class SyncManager {
             }
         } catch (Exception e) {
             logger.log(Level.SEVERE, kind + " save failed for " + uuid, e);
-            // Try to release lock even if save failed
-            try {
-                databaseManager.releaseLock(uuid, config.getServerName());
-                notifyLockReleased(uuid);
-            } catch (SQLException ex) {
-                logger.log(Level.WARNING, "Failed to release lock after " + kind + " save error for " + uuid, ex);
+
+            if (kind.releaseLock) {
+                // Quit save: try to release lock even if save failed
+                try {
+                    databaseManager.releaseLock(uuid, config.getServerName());
+                    notifyLockReleased(uuid);
+                } catch (SQLException ex) {
+                    logger.log(Level.WARNING, "Failed to release lock after " + kind + " save error for " + uuid, ex);
+                }
             }
+            // Online save: keep lock on error — will retry on next periodic save or quit
             return SaveResult.error(e.getMessage());
         }
     }

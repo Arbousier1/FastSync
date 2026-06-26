@@ -45,8 +45,7 @@ public class DataListener implements Listener {
         }
 
         Player player = event.getEntity();
-        // saveCause: "death"
-        syncManager.savePlayerAsync(player);
+        syncManager.savePlayerAsync(player, SyncManager.SaveKind.DEATH);
 
         if (config.isDebug()) {
             logger.info("[FastSync] Saved data for " + player.getUniqueId() + " on death.");
@@ -55,6 +54,10 @@ public class DataListener implements Listener {
 
     /**
      * Save all online players' data when the world is saved (save cause: "world_save").
+     *
+     * <p>Note: save-on-world-save is DISABLED by default. World saves fire frequently
+     * (every 5 minutes by default) and can cause unnecessary DB write load. Enable
+     * only if you need extra durability against crashes between periodic saves.
      */
     @EventHandler
     public void onWorldSave(WorldSaveEvent event) {
@@ -63,8 +66,7 @@ public class DataListener implements Listener {
         }
 
         for (Player player : Bukkit.getOnlinePlayers()) {
-            // saveCause: "world_save"
-            syncManager.savePlayerAsync(player);
+            syncManager.savePlayerAsync(player, SyncManager.SaveKind.WORLD_SAVE);
         }
 
         if (config.isDebug()) {

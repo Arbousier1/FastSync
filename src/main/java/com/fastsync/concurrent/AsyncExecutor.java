@@ -19,8 +19,10 @@ import java.util.logging.Logger;
  * management was specifically criticized. This executor provides:
  *   - Named threads for easy debugging
  *   - Bounded pool size AND bounded queue to prevent OOM under load
- *   - CallerRunsPolicy backpressure (caller thread runs the task when queue
- *     is full, naturally throttling submission rate)
+ *   - AbortPolicy: when queue is full, throw RejectedExecutionException
+ *     instead of running DB I/O on the calling thread (Folia-safe).
+ *     Callers are responsible for catching and handling the rejection:
+ *     quit saves fall back to synchronous execution, periodic saves skip.
  *   - Graceful shutdown with timeout
  *   - Proper exception logging
  */
@@ -73,7 +75,7 @@ public class AsyncExecutor {
 
         logger.info("Async executor '" + poolName + "' initialized: "
             + actualPoolSize + " threads, queue capacity " + actualQueueCapacity
-            + ", backpressure=CallerRunsPolicy.");
+            + ", backpressure=AbortPolicy (rejects on queue full; callers handle fallback).");
     }
 
     /**
@@ -86,8 +88,8 @@ public class AsyncExecutor {
     /**
      * Submit a task for async execution.
      * Exceptions are logged automatically.
-     * If the queue is full, CallerRunsPolicy runs the task on the calling
-     * thread, providing natural backpressure.
+     * If the queue is full, RejectedExecutionException is thrown (AbortPolicy).
+     * Callers must catch this and handle appropriately (fallback/skip).
      */
     public void execute(Runnable task) {
         executor.execute(() -> {
