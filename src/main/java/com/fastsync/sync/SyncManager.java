@@ -13,7 +13,7 @@ import com.fastsync.database.DatabaseManager;
 import com.fastsync.database.LockResult;
 import com.fastsync.database.VersionedData;
 import com.fastsync.log.OperationLog;
-import com.fastsync.log.ChronicleQueueLogManager;
+import com.fastsync.log.FileOperationLogManager;
 import com.fastsync.log.OperationType;
 import com.fastsync.redis.RedissonManager;
 import com.fastsync.redis.stream.StreamEvent;
@@ -72,7 +72,7 @@ public class SyncManager {
     private RedissonManager redissonManager;
     private SnapshotManager snapshotManager;
     private ConflictManager conflictManager;
-    private ChronicleQueueLogManager operationLogManager;
+    private FileOperationLogManager operationLogManager;
 
     // Dynamo-style p99.9 latency tracking
     private LatencyTracker loadLatency;
@@ -140,13 +140,13 @@ public class SyncManager {
         // Initialize conflict manager (Dynamo-style conflict recovery)
         conflictManager = new ConflictManager(logger, config, snapshotManager);
 
-        // Initialize operation log (Chronicle Queue: local append-only journal)
+        // Initialize operation log (file-based append-only journal, no JVM args needed)
         if (config.isOperationLogEnabled()) {
             try {
-                operationLogManager = new ChronicleQueueLogManager(
+                operationLogManager = new FileOperationLogManager(
                     plugin.getDataFolder().toPath(), config.getOperationLogRetention());
                 operationLogManager.initialize();
-                logger.info("Operation log enabled (Chronicle Queue, retention=" +
+                logger.info("Operation log enabled (file-based, retention=" +
                     config.getOperationLogRetention() + " per player).");
             } catch (Exception e) {
                 logger.log(Level.WARNING, "Failed to initialize operation log (Chronicle Queue)", e);
@@ -1044,7 +1044,7 @@ public class SyncManager {
             redissonManager = null;
         }
 
-        // Close operation log (Chronicle Queue)
+        // Close operation log (file-based)
         if (operationLogManager != null) {
             operationLogManager.close();
             operationLogManager = null;

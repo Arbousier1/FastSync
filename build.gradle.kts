@@ -52,8 +52,6 @@ dependencies {
     // Redis coordination: Redisson replaces Lettuce + sparrow-redis-message-broker.
     // Provides RFencedLock, RTopic (Pub/Sub), RStream (Streams) in one library.
     compileOnly("org.redisson:redisson:4.6.1")
-    // Local append-only player operation journal (replaces SQL operation_log table).
-    compileOnly("net.openhft:chronicle-queue:2026.4")
     // Type-safe SQL DSL for OCC + fencing token CAS queries.
     compileOnly("org.jooq:jooq:3.21.6")
     compileOnly("com.github.ben-manes.caffeine:caffeine:3.2.4")
@@ -87,7 +85,6 @@ dependencies {
     testImplementation("at.yawk.lz4:lz4-java:1.11.0")
     testImplementation("com.mysql:mysql-connector-j:9.7.0")
     testImplementation("org.redisson:redisson:4.6.1")
-    testImplementation("net.openhft:chronicle-queue:2026.4")
     testImplementation("org.jooq:jooq:3.21.6")
     testImplementation("com.github.ben-manes.caffeine:caffeine:3.2.4")
     testImplementation("org.reactivestreams:reactive-streams:1.0.4")
@@ -111,15 +108,6 @@ tasks.withType<JavaCompile>().configureEach {
 
 tasks.withType<Test>().configureEach {
     useJUnitPlatform()
-    // Chronicle Queue uses internal sun.nio APIs for mmap, requires --add-opens on JDK 16+
-    jvmArgs = listOf(
-        "-XX:+EnableDynamicAgentLoading",
-        "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",
-        "--add-opens=java.base/java.nio=ALL-UNNAMED",
-        "--add-opens=java.base/jdk.internal.misc=ALL-UNNAMED",
-        "--add-exports=java.base/jdk.internal.misc=ALL-UNNAMED",
-        "--add-exports=java.base/sun.nio.ch=ALL-UNNAMED"
-    )
     testLogging {
         events("passed", "skipped", "failed")
         showStandardStreams = true

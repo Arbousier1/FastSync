@@ -24,7 +24,6 @@ public class BenchmarkRunner {
                 .include(ChecksumBenchmark.class.getSimpleName())
                 .include(StreamEventBenchmark.class.getSimpleName())
                 .include(LatencyTrackerBenchmark.class.getSimpleName())
-                .include(ChronicleQueueBenchmark.class.getSimpleName())
                 .forks(0) // run in single JVM because jmh-core is test-scoped
                 .warmupIterations(2)
                 .warmupTime(TimeValue.seconds(1))

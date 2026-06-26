@@ -42,9 +42,6 @@ updates:
       redis:
         patterns:
           - "org.redisson:*"
-      chronicle:
-        patterns:
-          - "net.openhft:*"
       jooq:
         patterns:
           - "org.jooq:*"
