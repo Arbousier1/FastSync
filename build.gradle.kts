@@ -48,7 +48,7 @@ dependencies {
     // Maven Central runtime deps: compileOnly because Paper will download them
     // via plugin.yml `libraries:` at startup.
     compileOnly("com.zaxxer:HikariCP:7.1.0")
-    compileOnly("org.lz4:lz4-java:1.8.1")
+    compileOnly("at.yawk.lz4:lz4-java:1.11.0")
     compileOnly("com.mysql:mysql-connector-j:9.7.0")
     compileOnly("io.lettuce:lettuce-core:7.6.0.RELEASE")
     compileOnly("com.github.ben-manes.caffeine:caffeine:3.2.4")
@@ -80,7 +80,7 @@ dependencies {
     // Paper API + Maven Central runtime deps needed at test runtime.
     testImplementation("io.papermc.paper:paper-api:${paperVersion}-R0.1-SNAPSHOT")
     testImplementation("com.zaxxer:HikariCP:7.1.0")
-    testImplementation("org.lz4:lz4-java:1.8.1")
+    testImplementation("at.yawk.lz4:lz4-java:1.11.0")
     testImplementation("com.mysql:mysql-connector-j:9.7.0")
     testImplementation("io.lettuce:lettuce-core:7.6.0.RELEASE")
     testImplementation("com.github.ben-manes.caffeine:caffeine:3.2.4")
@@ -90,14 +90,6 @@ dependencies {
 java {
     toolchain {
         languageVersion.set(JavaLanguageVersion.of(21))
-    }
-}
-
-// Fix Gradle 9.x module name conflict: org.lz4:lz4-java and at.yawk.lz4:lz4-java
-// have the same module name. Substitute the fork with the original.
-configurations.all {
-    resolutionStrategy.dependencySubstitution {
-        substitute(module("at.yawk.lz4:lz4-java")).using(module("org.lz4:lz4-java:1.8.1"))
     }
 }
 

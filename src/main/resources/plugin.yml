@@ -9,7 +9,7 @@ website: https://github.com/Arbousier1/FastSync
 
 libraries:
   - com.zaxxer:HikariCP:7.1.0
-  - org.lz4:lz4-java:1.8.1
+  - at.yawk.lz4:lz4-java:1.11.0
   - com.mysql:mysql-connector-j:9.7.0
   - io.lettuce:lettuce-core:7.6.0.RELEASE
   - com.github.ben-manes.caffeine:caffeine:3.2.4
