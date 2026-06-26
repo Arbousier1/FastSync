@@ -204,8 +204,17 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
             case "saveall" -> {
                 sender.sendMessage(ChatColor.YELLOW + "[FastSync] Saving all online players...");
                 SchedulerUtil.runAsync(this, () -> {
-                    syncManager.saveAllOnlinePlayers();
-                    sender.sendMessage(ChatColor.GREEN + "[FastSync] All players saved!");
+                    try {
+                        syncManager.saveAllOnlinePlayers();
+                        SchedulerUtil.runGlobal(this, () ->
+                            sender.sendMessage(ChatColor.GREEN + "[FastSync] All players saved!")
+                        );
+                    } catch (Exception e) {
+                        getLogger().log(Level.SEVERE, "Saveall failed", e);
+                        SchedulerUtil.runGlobal(this, () ->
+                            sender.sendMessage(ChatColor.RED + "[FastSync] Saveall failed: " + e.getMessage())
+                        );
+                    }
                 });
             }
             case "log" -> {
@@ -239,24 +248,31 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                 final UUID fuuid = targetUuid;
                 SchedulerUtil.runAsync(this, () -> {
                     List<OperationLog> logs = syncManager.queryOperationLog(fuuid, limit);
+                    // Build all messages on async thread, then send on global thread
+                    List<String> messages = new java.util.ArrayList<>();
                     if (logs.isEmpty()) {
-                        sender.sendMessage(ChatColor.YELLOW + "[FastSync] No operation log entries for " + args[1]);
-                        return;
+                        messages.add(ChatColor.YELLOW + "[FastSync] No operation log entries for " + args[1]);
+                    } else {
+                        messages.add(ChatColor.GOLD + "===== Operation Log: " + args[1] + " (" + logs.size() + " entries) =====");
+                        for (OperationLog log : logs) {
+                            ChatColor typeColor = switch (log.type()) {
+                                case CONFLICT, CHECKSUM_FAIL, LOCK_EXPIRE -> ChatColor.RED;
+                                case SAVE, SNAPSHOT, RESTORE -> ChatColor.GREEN;
+                                case LOAD, LOCK_ACQUIRE, LOCK_RELEASE -> ChatColor.AQUA;
+                            };
+                            messages.add(ChatColor.GRAY + "#" + log.seq() + " " +
+                                typeColor + log.type() + ChatColor.GRAY +
+                                " | server=" + log.serverName() +
+                                " v=" + log.version() + " ft=" + log.fencingToken() +
+                                " sz=" + log.dataSize() + "B" +
+                                (log.detail() != null ? " | " + ChatColor.WHITE + log.detail() : ""));
+                        }
                     }
-                    sender.sendMessage(ChatColor.GOLD + "===== Operation Log: " + args[1] + " (" + logs.size() + " entries) =====");
-                    for (OperationLog log : logs) {
-                        ChatColor typeColor = switch (log.type()) {
-                            case CONFLICT, CHECKSUM_FAIL, LOCK_EXPIRE -> ChatColor.RED;
-                            case SAVE, SNAPSHOT, RESTORE -> ChatColor.GREEN;
-                            case LOAD, LOCK_ACQUIRE, LOCK_RELEASE -> ChatColor.AQUA;
-                        };
-                        sender.sendMessage(ChatColor.GRAY + "#" + log.seq() + " " +
-                            typeColor + log.type() + ChatColor.GRAY +
-                            " | server=" + log.serverName() +
-                            " v=" + log.version() + " ft=" + log.fencingToken() +
-                            " sz=" + log.dataSize() + "B" +
-                            (log.detail() != null ? " | " + ChatColor.WHITE + log.detail() : ""));
-                    }
+                    SchedulerUtil.runGlobal(this, () -> {
+                        for (String msg : messages) {
+                            sender.sendMessage(msg);
+                        }
+                    });
                 });
             }
             default -> sendHelp(sender, label);

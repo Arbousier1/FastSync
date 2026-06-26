@@ -26,6 +26,13 @@ public class CompressionUtil {
     public static final byte FORMAT_VERSION = 1;
     public static final byte FLAG_COMPRESSED = 0x01;
 
+    /**
+     * Maximum allowed decompressed size. Prevents OOM from corrupted/malicious
+     * blobs with a forged original-length header (e.g. 0x7FFFFFFF).
+     * 8MB is well above any realistic player data payload (~50-200KB typical).
+     */
+    private static final int MAX_DECOMPRESSED_SIZE = 8 * 1024 * 1024;
+
     private static final LZ4Factory factory = LZ4Factory.fastestInstance();
     private static final LZ4Compressor compressor = factory.fastCompressor();
     private static final LZ4FastDecompressor decompressor = factory.fastDecompressor();
@@ -123,6 +130,13 @@ public class CompressionUtil {
                                | ((wrappedData[3] & 0xFF) << 16)
                                | ((wrappedData[4] & 0xFF) << 8)
                                | (wrappedData[5] & 0xFF);
+
+            // Guard against corrupted/malicious blobs with inflated original-length
+            if (originalLength > MAX_DECOMPRESSED_SIZE) {
+                throw new IllegalArgumentException(
+                    "Decompressed size " + originalLength + " exceeds max " + MAX_DECOMPRESSED_SIZE
+                    + " — possible data corruption");
+            }
 
             int compressedLen = wrappedData.length - 6;
             byte[] restored = new byte[originalLength];

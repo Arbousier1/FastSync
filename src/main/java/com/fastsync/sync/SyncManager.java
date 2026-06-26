@@ -700,97 +700,7 @@ public class SyncManager {
         asyncExecutor.execute(() -> {
             saveLock.lock(); // must wait — quit save must persist final state
             try {
-                long startTime = System.nanoTime();
-
-                byte[] serialized = PlayerDataSerializer.serialize(data);
-                byte[] compressed = CompressionUtil.wrap(serialized, config.getCompressionMinSize(), config.isCompressionEnabled());
-                long checksum = DatabaseManager.computeChecksum(serialized);
-
-                long serElapsedMs = (System.nanoTime() - startTime) / 1_000_000;
-                if (serializeLatency != null) serializeLatency.record(serElapsedMs);
-
-                if (config.isLogTiming()) {
-                    logger.info("[Timing] Serialize for " + uuid + ": " + serElapsedMs + "ms" +
-                        " (serialized=" + serialized.length + " bytes, stored=" + compressed.length + " bytes)");
-                }
-
-                // Optimistic concurrency save with fencing token (Dynamo + Kleppmann)
-                long expectedVersion = data.getVersion();
-                long fencingToken = data.getFencingToken();
-                long saveStart = System.nanoTime();
-                boolean saved = databaseManager.saveData(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
-                long saveElapsedMs = (System.nanoTime() - saveStart) / 1_000_000;
-                if (saveLatency != null) saveLatency.record(saveElapsedMs);
-
-                if (!saved) {
-                    // Version conflict or fencing token violation!
-                    // Another server wrote newer data, or a stale lock holder tried to write.
-                    long actualVersion = databaseManager.getCurrentVersion(uuid);
-                    long actualFencingToken = databaseManager.getCurrentFencingToken(uuid);
-                    conflictManager.handleConflict(uuid, data, expectedVersion, actualVersion);
-                    logger.warning("[Fencing] Save rejected for " + uuid +
-                        " (expected v" + expectedVersion + "/ft" + fencingToken +
-                        ", actual v" + actualVersion + "/ft" + actualFencingToken + ")");
-
-                    // Log conflict (Raft-inspired per-UUID ordered log)
-                    logOperation(uuid, OperationType.CONFLICT, fencingToken, expectedVersion,
-                        compressed.length, "Conflict: expected v" + expectedVersion + "/ft" + fencingToken +
-                        ", actual v" + actualVersion + "/ft" + actualFencingToken);
-
-                    if (saveLatency != null) saveLatency.recordError();
-
-                    // Release the DB lock on conflict — another server has newer data,
-                    // holding the lock here would block the other server from writing.
-                    // Data safety is still guaranteed by version/fencing CAS.
-                    try {
-                        databaseManager.releaseLock(uuid, config.getServerName());
-                    } catch (SQLException lockEx) {
-                        logger.log(Level.WARNING, "Failed to release lock after conflict for " + uuid, lockEx);
-                    }
-                } else {
-                    // Save succeeded — advance local version so the next periodic save
-                    // uses the correct expectedVersion (v -> v+1).
-                    advanceVersion(uuid, expectedVersion);
-                    // Success - create snapshot only when configured to do so on save.
-                    // Snapshot creation is controlled by snapshot.save-trigger config.
-                    // Values: "never" (default, only conflict-driven snapshots),
-                    // "always" (every save), or a comma-separated cause list like
-                    // "death,disconnect,shutdown,world_save".
-                    // Conflict-driven snapshots in ConflictManager are ALWAYS created
-                    // regardless of this setting.
-                    if (snapshotManager != null && shouldCreateSnapshot(data.getSaveCause())) {
-                        snapshotManager.createSnapshot(uuid, compressed, data.getSaveCause())
-                            .thenRun(() -> snapshotManager.pruneSnapshots(uuid, config.getMaxSnapshots()));
-                    }
-
-                    if (config.isLogTiming()) {
-                        long totalElapsed = (System.nanoTime() - startTime) / 1_000_000;
-                        logger.info("[Timing] Total save for " + uuid + ": " + totalElapsed + "ms (v" + expectedVersion + "->v" + (expectedVersion + 1) + ", ft=" + fencingToken + ")");
-                    }
-
-                    if (config.isDebug()) {
-                        logger.info("Saved data for " + uuid + " (v" + (expectedVersion + 1) + ", " + compressed.length + " bytes in DB)");
-                    }
-
-                    // Log successful save (Raft-inspired per-UUID ordered log)
-                    logOperation(uuid, OperationType.SAVE, fencingToken, expectedVersion + 1,
-                        compressed.length, "Saved v" + (expectedVersion + 1) + " cause=" + data.getSaveCause());
-
-                    // Publish critical event: player checked out (Streams — recoverable)
-                    publishCheckout(uuid, expectedVersion + 1, fencingToken, data.getSaveCause());
-                }
-
-                // Notify other servers via Redis that the lock is released
-                notifyLockReleased(uuid);
-            } catch (Exception e) {
-                logger.log(Level.SEVERE, "Failed to save data for " + uuid, e);
-                // Try to release lock even if save failed
-                try {
-                    databaseManager.releaseLock(uuid, config.getServerName());
-                    notifyLockReleased(uuid);
-                } catch (SQLException ex) {
-                    logger.log(Level.WARNING, "Failed to release lock after save error for " + uuid, ex);
-                }
+                persistCollectedData(uuid, data, SaveKind.QUIT);
             } finally {
                 saveLock.unlock();
                 playerSaveLocks.remove(uuid, saveLock);
@@ -1303,65 +1213,65 @@ public class SyncManager {
      * for all futures to complete before returning.
      */
     public void saveAllOnlinePlayers() {
-        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        int total = 0;
+        int success = 0;
+        int failed = 0;
+        List<UUID> failedPlayers = new ArrayList<>();
+        List<CompletableFuture<SaveResult>> futures = new ArrayList<>();
         Plugin plugin = JavaPlugin.getPlugin(FastSync.class);
 
         for (Player player : Bukkit.getOnlinePlayers()) {
             if (!activePlayers.containsKey(player.getUniqueId())) {
                 continue;
             }
+            total++;
             UUID uuid = player.getUniqueId();
 
-            // Collect on the entity's region thread (Folia-safe), then save async.
-            // future completes ONLY after the DB save finishes (or fails).
-            CompletableFuture<Void> future = new CompletableFuture<>();
+            CompletableFuture<SaveResult> future = new CompletableFuture<>();
             SchedulerUtil.runAtEntity(plugin, player, () -> {
                 try {
                     PlayerData data = collectPlayerData(player);
                     pendingSaveCount.incrementAndGet();
                     asyncExecutor.execute(() -> {
+                        SaveResult result;
                         try {
-                            byte[] serialized = PlayerDataSerializer.serialize(data);
-                            byte[] compressed = CompressionUtil.wrap(serialized, config.getCompressionMinSize(), config.isCompressionEnabled());
-                            long checksum = DatabaseManager.computeChecksum(serialized);
-                            long expectedVersion = data.getVersion();
-                            long fencingToken = data.getFencingToken();
-                            boolean saved = databaseManager.saveData(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
-                            if (!saved) {
-                                long actualVersion = databaseManager.getCurrentVersion(uuid);
-                                conflictManager.handleConflict(uuid, data, expectedVersion, actualVersion);
-                                try {
-                                    databaseManager.releaseLock(uuid, config.getServerName());
-                                } catch (SQLException lockEx) {
-                                    logger.log(Level.WARNING, "Failed to release lock after bulk save conflict for " + uuid, lockEx);
-                                }
-                            } else {
-                                advanceVersion(uuid, expectedVersion);
-                            }
-                            notifyLockReleased(uuid);
-                            future.complete(null);
+                            result = persistCollectedData(uuid, data, SaveKind.BULK);
                         } catch (Exception e) {
-                            logger.log(Level.SEVERE, "Failed to save data for " + uuid + " during bulk save", e);
-                            future.completeExceptionally(e);
+                            result = SaveResult.error(e.getMessage());
                         } finally {
                             pendingSaveCount.decrementAndGet();
                         }
+                        future.complete(result);
                     });
                 } catch (Exception e) {
                     logger.log(Level.SEVERE, "Failed to collect data for " + uuid + " during bulk save", e);
-                    future.completeExceptionally(e);
+                    future.complete(SaveResult.error(e.getMessage()));
                 }
             }, () -> {
-                // retired callback: entity no longer valid (player logged out, etc.)
-                // Complete the future so saveAllOnlinePlayers() doesn't hang.
-                future.complete(null);
+                future.complete(SaveResult.error("entity retired"));
             });
             futures.add(future);
         }
 
-        // Wait for all DB saves to actually complete (not just collection).
-        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-        logger.info("Saved data for all online players.");
+        // Wait for all DB saves to complete. Don't throw on individual failures.
+        for (CompletableFuture<SaveResult> f : futures) {
+            try {
+                SaveResult result = f.join();
+                if (result.success()) {
+                    success++;
+                } else {
+                    failed++;
+                }
+            } catch (Exception e) {
+                failed++;
+            }
+        }
+
+        if (failed > 0) {
+            logger.warning("saveAllOnlinePlayers: " + success + "/" + total + " succeeded, " + failed + " failed.");
+        } else {
+            logger.info("Saved data for all " + total + " online players.");
+        }
     }
 
     /**
@@ -1402,37 +1312,14 @@ public class SyncManager {
                     return;
                 }
                 try {
-                    byte[] serialized = PlayerDataSerializer.serialize(data);
-                    byte[] compressed = CompressionUtil.wrap(serialized, config.getCompressionMinSize(), config.isCompressionEnabled());
-                    long checksum = DatabaseManager.computeChecksum(serialized);
-                long expectedVersion = data.getVersion();
-                long fencingToken = data.getFencingToken();
-                boolean saved = databaseManager.saveData(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
-                if (!saved) {
-                    long actualVersion = databaseManager.getCurrentVersion(uuid);
-                    conflictManager.handleConflict(uuid, data, expectedVersion, actualVersion);
-                    if (saveLatency != null) saveLatency.recordError();
-                    // Release DB lock on conflict so other servers can proceed.
-                    try {
-                        databaseManager.releaseLock(uuid, config.getServerName());
-                    } catch (SQLException lockEx) {
-                        logger.log(Level.WARNING, "Failed to release lock after periodic conflict for " + uuid, lockEx);
-                    }
-                } else {
-                    // Advance local version for next periodic save (v -> v+1)
-                    advanceVersion(uuid, expectedVersion);
+                    persistCollectedData(uuid, data, SaveKind.PERIODIC);
+                } catch (Exception e) {
+                    logger.log(Level.WARNING, "Periodic save failed for " + uuid, e);
+                } finally {
+                    saveLock.unlock();
+                    playerSaveLocks.remove(uuid, saveLock);
+                    pendingSaveCount.decrementAndGet();
                 }
-
-                if (config.isDebug()) {
-                    logger.info("Periodic save for " + uuid + " (v" + expectedVersion + "->v" + (expectedVersion + 1) + ", " + compressed.length + " bytes)");
-                }
-            } catch (Exception e) {
-                logger.log(Level.WARNING, "Periodic save failed for " + uuid, e);
-            } finally {
-                saveLock.unlock();
-                playerSaveLocks.remove(uuid, saveLock);
-                pendingSaveCount.decrementAndGet();
-            }
         });
         }, () -> {
             // retired callback: entity no longer valid (player logged out during periodic save tick)
@@ -1519,6 +1406,124 @@ public class SyncManager {
             if (current == null) return null; // player already cleaned up (quit)
             return Math.max(current, savedVersion + 1);
         });
+    }
+
+    // ==================== Unified Save Path ====================
+
+    /** Save kind for logging and behavior differentiation. */
+    private enum SaveKind { QUIT, PERIODIC, BULK }
+
+    /** Result of a save operation. */
+    public record SaveResult(boolean success, long expectedVersion, long actualVersion, int compressedSize, String errorMessage) {
+        public static SaveResult success(long version, int size) {
+            return new SaveResult(true, version, version + 1, size, null);
+        }
+        public static SaveResult conflict(long expected, long actual, int size) {
+            return new SaveResult(false, expected, actual, size, "version conflict");
+        }
+        public static SaveResult error(String msg) {
+            return new SaveResult(false, 0, 0, 0, msg);
+        }
+    }
+
+    /**
+     * Unified save path: serialize → compress → checksum → DB CAS → conflict/advance/lock-release.
+     *
+     * <p>All three save paths (quit, periodic, bulk) converge here to prevent
+     * "fix one, forget the other" drift. The caller is responsible for:
+     * <ul>
+     *   <li>Per-UUID locking (quit: lock+wait, periodic: tryLock+skip)</li>
+     *   <li>pendingSaveCount management</li>
+     *   <li>playerVersions/playerFencingTokens cleanup (quit only)</li>
+     * </ul>
+     */
+    private SaveResult persistCollectedData(UUID uuid, PlayerData data, SaveKind kind) {
+        long startTime = System.nanoTime();
+        try {
+            // 1. Serialize
+            byte[] serialized = PlayerDataSerializer.serialize(data);
+            // 2. Compress (respects config.isCompressionEnabled())
+            byte[] compressed = CompressionUtil.wrap(serialized, config.getCompressionMinSize(), config.isCompressionEnabled());
+            // 3. Checksum on raw serialized (not compressed)
+            long checksum = DatabaseManager.computeChecksum(serialized);
+
+            long serElapsedMs = (System.nanoTime() - startTime) / 1_000_000;
+            if (serializeLatency != null) serializeLatency.record(serElapsedMs);
+
+            if (config.isLogTiming()) {
+                logger.info("[Timing] Serialize " + kind + " for " + uuid + ": " + serElapsedMs + "ms"
+                    + " (serialized=" + serialized.length + " bytes, stored=" + compressed.length + " bytes)");
+            }
+
+            // 4. DB CAS save with version + fencing token
+            long expectedVersion = data.getVersion();
+            long fencingToken = data.getFencingToken();
+            long saveStart = System.nanoTime();
+            boolean saved = databaseManager.saveData(uuid, compressed, checksum, expectedVersion, fencingToken, config.getServerName());
+            long saveElapsedMs = (System.nanoTime() - saveStart) / 1_000_000;
+            if (saveLatency != null) saveLatency.record(saveElapsedMs);
+
+            if (!saved) {
+                // 5a. Conflict: release lock + log + conflict snapshot
+                long actualVersion = databaseManager.getCurrentVersion(uuid);
+                long actualFencingToken = databaseManager.getCurrentFencingToken(uuid);
+                conflictManager.handleConflict(uuid, data, expectedVersion, actualVersion);
+                logger.warning("[Fencing] " + kind + " save rejected for " + uuid +
+                    " (expected v" + expectedVersion + "/ft" + fencingToken +
+                    ", actual v" + actualVersion + "/ft" + actualFencingToken + ")");
+
+                logOperation(uuid, OperationType.CONFLICT, fencingToken, expectedVersion,
+                    compressed.length, kind + " conflict: expected v" + expectedVersion + "/ft" + fencingToken +
+                    ", actual v" + actualVersion + "/ft" + actualFencingToken);
+
+                if (saveLatency != null) saveLatency.recordError();
+
+                try {
+                    databaseManager.releaseLock(uuid, config.getServerName());
+                } catch (SQLException lockEx) {
+                    logger.log(Level.WARNING, "Failed to release lock after " + kind + " conflict for " + uuid, lockEx);
+                }
+                notifyLockReleased(uuid);
+                return SaveResult.conflict(expectedVersion, actualVersion, compressed.length);
+            } else {
+                // 5b. Success: advance version + log + snapshot + publish
+                advanceVersion(uuid, expectedVersion);
+
+                if (snapshotManager != null && shouldCreateSnapshot(data.getSaveCause())) {
+                    snapshotManager.createSnapshot(uuid, compressed, data.getSaveCause())
+                        .thenRun(() -> snapshotManager.pruneSnapshots(uuid, config.getMaxSnapshots()));
+                }
+
+                logOperation(uuid, OperationType.SAVE, fencingToken, expectedVersion + 1,
+                    compressed.length, kind + " saved v" + (expectedVersion + 1) + " cause=" + data.getSaveCause());
+
+                publishCheckout(uuid, expectedVersion + 1, fencingToken, data.getSaveCause());
+
+                notifyLockReleased(uuid);
+
+                if (config.isDebug()) {
+                    logger.info(kind + " save for " + uuid + " (v" + expectedVersion + "->v" + (expectedVersion + 1)
+                        + ", " + compressed.length + " bytes)");
+                }
+
+                if (config.isLogTiming()) {
+                    long totalElapsed = (System.nanoTime() - startTime) / 1_000_000;
+                    logger.info("[Timing] Total " + kind + " save for " + uuid + ": " + totalElapsed + "ms");
+                }
+
+                return SaveResult.success(expectedVersion, compressed.length);
+            }
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, kind + " save failed for " + uuid, e);
+            // Try to release lock even if save failed
+            try {
+                databaseManager.releaseLock(uuid, config.getServerName());
+                notifyLockReleased(uuid);
+            } catch (SQLException ex) {
+                logger.log(Level.WARNING, "Failed to release lock after " + kind + " save error for " + uuid, ex);
+            }
+            return SaveResult.error(e.getMessage());
+        }
     }
 
     // ==================== Snapshot Trigger Helper ====================

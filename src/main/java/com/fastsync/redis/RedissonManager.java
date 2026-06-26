@@ -192,6 +192,15 @@ public class RedissonManager {
         createConsumerGroup();
         recoverPendingEntries();
 
+        // IMPORTANT: create dispatcher BEFORE starting the consumer loop.
+        // If messages exist in the stream, the consumer may immediately try to
+        // dispatch them via messageDispatcher — if it's null, that's an NPE.
+        messageDispatcher = Executors.newFixedThreadPool(2, r -> {
+            Thread t = new Thread(r, "FastSync-Stream-Dispatcher");
+            t.setDaemon(true);
+            return t;
+        });
+
         running.set(true);
         consumerExecutor = Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "FastSync-Stream-Consumer");
@@ -199,16 +208,6 @@ public class RedissonManager {
             return t;
         });
         consumerExecutor.submit(this::consumeLoop);
-
-        // Dedicated dispatcher (2 threads) so a slow listener no longer blocks
-        // readGroup. The consume loop reads messages and immediately hands them
-        // off here; ACK happens in the dispatcher's completion handler so a
-        // crashed consumer can still recover the message via autoClaim.
-        messageDispatcher = Executors.newFixedThreadPool(2, r -> {
-            Thread t = new Thread(r, "FastSync-Stream-Dispatcher");
-            t.setDaemon(true);
-            return t;
-        });
 
         // Announce this server is up and ready to accept players.
         publish(StreamEvent.create(StreamEventType.SERVER_START, null, serverName,

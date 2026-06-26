@@ -2,6 +2,7 @@ package com.fastsync.concurrent;
 
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -61,7 +62,34 @@ public class AsyncExecutor {
             TimeUnit.MILLISECONDS,
             new LinkedBlockingQueue<>(actualQueueCapacity),
             threadFactory,
-            new ThreadPoolExecutor.CallerRunsPolicy()
+            (r, executor) -> {
+                // Safety: if the queue is full and the caller is a Bukkit/Folia
+                // main/region thread, we must NOT run DB I/O on it.
+                // Instead, block briefly (up to 100ms) waiting for a slot.
+                // If still full, throw RejectedExecutionException so the caller
+                // can handle it (quit save will catch and retry; periodic save
+                // will skip — both are acceptable).
+                String threadName = Thread.currentThread().getName();
+                boolean isGameThread = threadName.contains("Server thread")
+                    || threadName.contains("Region")
+                    || threadName.contains("Async Chat Thread");
+
+                if (isGameThread) {
+                    try {
+                        if (!executor.getQueue().offer(r, 100, TimeUnit.MILLISECONDS)) {
+                            throw new RejectedExecutionException(
+                                "Queue full and caller is game thread " + threadName
+                                + " — refusing to run DB I/O on game thread");
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new RejectedExecutionException("Interrupted while waiting for queue slot", e);
+                    }
+                } else {
+                    // Caller is an async thread — safe to run inline (CallerRunsPolicy)
+                    r.run();
+                }
+            }
         );
 
         logger.info("Async executor '" + poolName + "' initialized: "
