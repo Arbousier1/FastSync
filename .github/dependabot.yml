@@ -33,19 +33,21 @@ updates:
         patterns:
           - "org.junit.jupiter:*"
           - "org.junit:*"
-        # JUnit 6 requires Gradle 8.14+ for platform jar alignment.
-        # Stay on 5.x until we upgrade Gradle wrapper.
+        # JUnit 5.12+ and 6.x require Gradle 8.14+ for platform jar alignment.
+        # Stay on 5.11.x until we upgrade Gradle wrapper.
         ignore:
           - dependency-name: "org.junit:junit-bom"
-            update-types: ["version-update:semver-major"]
+            update-types: ["version-update:semver-major", "version-update:semver-minor"]
           - dependency-name: "org.junit.jupiter:junit-jupiter"
-            update-types: ["version-update:semver-major"]
+            update-types: ["version-update:semver-major", "version-update:semver-minor"]
       testcontainers:
         patterns:
           - "org.testcontainers:*"
-        # Sub-modules (mysql, junit-jupiter) don't always have 2.0.x releases
-        # when the parent does. Ignore major bumps to avoid broken builds.
+        # Sub-modules (mysql, junit-jupiter) don't have 2.0.x releases.
+        # Keep all on 1.21.x for version alignment.
         ignore:
+          - dependency-name: "org.testcontainers:testcontainers"
+            update-types: ["version-update:semver-major"]
           - dependency-name: "org.testcontainers:mysql"
             update-types: ["version-update:semver-major"]
           - dependency-name: "org.testcontainers:junit-jupiter"
