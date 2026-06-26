@@ -62,7 +62,9 @@ dependencies {
     implementation("net.momirealms:sparrow-redis-message-broker:0.0.7")
 
     // Test
-    testImplementation(platform("org.junit:junit-bom:6.1.0"))
+    // Note: JUnit 6 requires Gradle 8.14+ for platform jar alignment.
+    // Stay on 5.x until we upgrade Gradle wrapper.
+    testImplementation(platform("org.junit:junit-bom:5.14.4"))
     testImplementation("org.junit.jupiter:junit-jupiter")
     // Note: testcontainers sub-modules (mysql, junit-jupiter) don't have 2.0.x
     // releases yet, only the parent POM. Use 1.21.4 for sub-modules.
