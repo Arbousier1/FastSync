@@ -39,6 +39,15 @@ updates:
       mockito:
         patterns:
           - "org.mockito:*"
+      redis:
+        patterns:
+          - "org.redisson:*"
+      chronicle:
+        patterns:
+          - "net.openhft:*"
+      jooq:
+        patterns:
+          - "org.jooq:*"
     ignore:
       # Velocity 4.0.0-SNAPSHOT doesn't exist on Sonatype Snapshots yet.
       # Stay on 3.x until Velocity 4 is released.

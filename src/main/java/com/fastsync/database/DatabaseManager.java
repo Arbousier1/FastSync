@@ -4,28 +4,61 @@ import com.fastsync.config.ConfigManager;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 
+import org.jooq.DSLContext;
+import org.jooq.Field;
+import org.jooq.Record;
+import org.jooq.SQLDialect;
+import org.jooq.Table;
+import org.jooq.exception.DataAccessException;
+
 import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.sql.Statement;
 import java.util.UUID;
-import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.zip.CRC32;
+
+import static org.jooq.impl.DSL.field;
+import static org.jooq.impl.DSL.name;
+import static org.jooq.impl.DSL.table;
+import static org.jooq.impl.DSL.using;
 
 /**
  * Database manager using HikariCP connection pool.
  * Stores player data as LONGBLOB (raw compressed byte[]) - no base64 string encoding.
  * Implements cross-server lock mechanism to prevent data races.
  * Uses Dynamo-style optimistic concurrency control based on a version column.
+ *
+ * <p>All data access is expressed with jOOQ's type-safe DSL. No jOOQ code
+ * generation is used: table and column references are built with the plain
+ * {@code table(name(...))} / {@code field(name(...), type.class)} factory
+ * methods. DDL (CREATE/ALTER TABLE) and the MySQL {@code LAST_INSERT_ID(expr)}
+ * idiom are still issued as raw SQL through {@link DSLContext#execute(String)},
+ * since jOOQ's DDL DSL is overly verbose and {@code LAST_INSERT_ID} has no DSL
+ * equivalent. Each operation borrows a single connection from HikariCP and wraps
+ * it in a per-call {@code DSLContext} via {@code DSL.using(connection, SQLDialect.MYSQL)}.
  */
 public class DatabaseManager {
+
+    // ---- jOOQ table/column references (no code generation) ----
+    // Column names are prefix-independent; only the table name carries the
+    // configured prefix, so the column Fields can be static constants while the
+    // Table is resolved once the prefix is known in initialize().
+    private static final Field<String> UUID_FIELD = field(name("uuid"), String.class);
+    private static final Field<byte[]> DATA_FIELD = field(name("data"), byte[].class);
+    private static final Field<Long> VERSION_FIELD = field(name("version"), Long.class);
+    private static final Field<Long> CHECKSUM_FIELD = field(name("checksum"), Long.class);
+    private static final Field<Long> FENCING_TOKEN_FIELD = field(name("fencing_token"), Long.class);
+    private static final Field<Long> OP_SEQ_FIELD = field(name("op_seq"), Long.class);
+    private static final Field<String> LOCKED_BY_FIELD = field(name("locked_by"), String.class);
+    private static final Field<Long> LOCKED_AT_FIELD = field(name("locked_at"), Long.class);
+    private static final Field<String> LAST_SERVER_FIELD = field(name("last_server"), String.class);
+    private static final Field<Long> LAST_UPDATED_FIELD = field(name("last_updated"), Long.class);
 
     private final Logger logger;
     private final ConfigManager config;
     private HikariDataSource dataSource;
     private String dataTable;
+    private Table<Record> playerData;
 
     public DatabaseManager(Logger logger, ConfigManager config) {
         this.logger = logger;
@@ -33,10 +66,20 @@ public class DatabaseManager {
     }
 
     /**
+     * Wrap a single JDBC connection in a jOOQ {@link DSLContext} configured for
+     * MySQL. A fresh context is created per operation so that each borrows
+     * exactly one connection from the HikariCP pool.
+     */
+    private static DSLContext dsl(Connection connection) {
+        return using(connection, SQLDialect.MYSQL);
+    }
+
+    /**
      * Initialize the database connection pool and create tables.
      */
     public void initialize() throws SQLException {
         dataTable = config.getTablePrefix() + "player_data";
+        playerData = table(name(dataTable));
 
         HikariConfig hikariConfig = new HikariConfig();
 
@@ -82,6 +125,10 @@ public class DatabaseManager {
      * Create the player data table if it doesn't exist.
      * Uses LONGBLOB to support large compressed data without the 64KB BLOB limit.
      * Includes version and checksum columns for optimistic concurrency control.
+     *
+     * <p>DDL is issued as raw SQL via {@link DSLContext#execute(String)} because
+     * jOOQ's DDL DSL is far more verbose than the equivalent CREATE TABLE
+     * statement for no type-safety benefit here.
      */
     private void createTables() throws SQLException {
         String sql = String.format("""
@@ -101,38 +148,59 @@ public class DatabaseManager {
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """, dataTable);
 
-        try (Connection conn = dataSource.getConnection();
-             Statement stmt = conn.createStatement()) {
-            stmt.execute(sql);
+        try (Connection conn = dataSource.getConnection()) {
+            dsl(conn).execute(sql);
         }
     }
 
     /**
      * Migrate the schema for existing tables.
      * Adds version and checksum columns if they don't already exist.
+     *
+     * <p>MySQL 8+ honours {@code ADD COLUMN IF NOT EXISTS}; older versions raise
+     * a "Duplicate column" error which jOOQ surfaces as a
+     * {@link DataAccessException} wrapping the underlying {@link SQLException}.
+     * We walk the exception cause chain to detect that benign case and suppress
+     * it, logging anything else as a migration note.
      */
     private void migrateSchema() throws SQLException {
-        // Add version column if it doesn't exist (MySQL 8+ supports IF NOT EXISTS)
-        // For older MySQL, use information_schema check
+        // Add columns if they don't exist (MySQL 8+ supports IF NOT EXISTS)
         String[] migrations = {
             String.format("ALTER TABLE `%s` ADD COLUMN IF NOT EXISTS `version` BIGINT NOT NULL DEFAULT 0", dataTable),
             String.format("ALTER TABLE `%s` ADD COLUMN IF NOT EXISTS `checksum` BIGINT NOT NULL DEFAULT 0", dataTable),
             String.format("ALTER TABLE `%s` ADD COLUMN IF NOT EXISTS `fencing_token` BIGINT NOT NULL DEFAULT 0", dataTable),
             String.format("ALTER TABLE `%s` ADD COLUMN IF NOT EXISTS `op_seq` BIGINT NOT NULL DEFAULT 0", dataTable)
         };
-        try (Connection conn = dataSource.getConnection();
-             Statement stmt = conn.createStatement()) {
+        try (Connection conn = dataSource.getConnection()) {
+            DSLContext dsl = dsl(conn);
             for (String sql : migrations) {
                 try {
-                    stmt.execute(sql);
-                } catch (SQLException e) {
+                    dsl.execute(sql);
+                } catch (DataAccessException e) {
                     // Column may already exist (MySQL versions that don't support IF NOT EXISTS)
-                    if (!e.getMessage().contains("Duplicate column")) {
+                    if (!isDuplicateColumnError(e)) {
                         logger.warning("Schema migration note: " + e.getMessage());
                     }
                 }
             }
         }
+    }
+
+    /**
+     * Walk the jOOQ exception cause chain looking for the MySQL
+     * "Duplicate column" error, which is the expected outcome of adding a column
+     * that already exists on MySQL versions without {@code IF NOT EXISTS} support.
+     */
+    private static boolean isDuplicateColumnError(Throwable e) {
+        Throwable t = e;
+        while (t != null) {
+            String message = t.getMessage();
+            if (message != null && message.contains("Duplicate column")) {
+                return true;
+            }
+            t = t.getCause();
+        }
+        return false;
     }
 
     /**
@@ -153,6 +221,10 @@ public class DatabaseManager {
      * concurrency: different UUIDs never contend on the same index entry.
      * The subsequent SELECT is also a PK point lookup (no index scan).
      *
+     * <p>The UPDATE and the read-back SELECT run on a single borrowed connection
+     * so the fencing token we read is the one we just wrote (the row is now locked
+     * by this server, so no other server can bump the token in between).
+     *
      * @return LockResult with acquired=true and the fencing token, or acquired=false
      */
     public LockResult acquireLock(UUID uuid, String serverName) throws SQLException {
@@ -162,54 +234,57 @@ public class DatabaseManager {
         // First, ensure the player row exists
         ensurePlayerExists(uuid);
 
-        // Atomically acquire lock AND increment fencing token
-        String updateSql = String.format("""
-            UPDATE `%s` SET locked_by = ?, locked_at = ?, fencing_token = fencing_token + 1
-            WHERE uuid = ? AND (locked_by IS NULL OR locked_at < ? OR locked_by = ?)
-            """, dataTable);
+        // Atomically acquire lock AND increment fencing token, then read back the
+        // new token on the same connection.
+        try (Connection conn = dataSource.getConnection()) {
+            DSLContext dsl = dsl(conn);
 
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(updateSql)) {
-            ps.setString(1, serverName);
-            ps.setLong(2, now);
-            ps.setString(3, uuid.toString());
-            ps.setLong(4, expiredTime);
-            ps.setString(5, serverName);
-            int updated = ps.executeUpdate();
+            int updated = dsl.update(playerData)
+                .set(LOCKED_BY_FIELD, serverName)
+                .set(LOCKED_AT_FIELD, now)
+                .set(FENCING_TOKEN_FIELD, FENCING_TOKEN_FIELD.plus(1))
+                .where(UUID_FIELD.eq(uuid.toString())
+                    .and(LOCKED_BY_FIELD.isNull()
+                        .or(LOCKED_AT_FIELD.lt(expiredTime))
+                        .or(LOCKED_BY_FIELD.eq(serverName))))
+                .execute();
+
             if (updated == 0) {
                 return LockResult.FAILED;
             }
-        }
 
-        // Read back the new fencing token
-        String selectSql = String.format(
-            "SELECT fencing_token FROM `%s` WHERE uuid = ?", dataTable);
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(selectSql)) {
-            ps.setString(1, uuid.toString());
-            try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) {
-                    return LockResult.success(rs.getLong("fencing_token"));
-                }
-            }
+            // Read back the new fencing token (PK point lookup, no locking needed)
+            Long token = dsl.select(FENCING_TOKEN_FIELD)
+                .from(playerData)
+                .where(UUID_FIELD.eq(uuid.toString()))
+                .fetchOne(FENCING_TOKEN_FIELD);
+
+            return token != null ? LockResult.success(token) : LockResult.FAILED;
         }
-        return LockResult.FAILED;
     }
 
     /**
      * Ensure a player row exists in the database.
+     *
+     * <p>Rendered as {@code INSERT IGNORE INTO ...} via jOOQ's
+     * {@code onDuplicateKeyIgnore()}, which on the MySQL dialect emits
+     * {@code INSERT IGNORE}. This is a no-op if the row already exists.
      */
     private void ensurePlayerExists(UUID uuid) throws SQLException {
-        String sql = String.format("""
-            INSERT IGNORE INTO `%s` (uuid, data, version, checksum, fencing_token, op_seq, locked_by, locked_at, last_server, last_updated)
-            VALUES (?, ?, 0, 0, 0, 0, NULL, NULL, NULL, 0)
-            """, dataTable);
-
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setString(1, uuid.toString());
-            ps.setBytes(2, new byte[0]);
-            ps.executeUpdate();
+        try (Connection conn = dataSource.getConnection()) {
+            dsl(conn).insertInto(playerData)
+                .set(UUID_FIELD, uuid.toString())
+                .set(DATA_FIELD, new byte[0])
+                .set(VERSION_FIELD, 0L)
+                .set(CHECKSUM_FIELD, 0L)
+                .set(FENCING_TOKEN_FIELD, 0L)
+                .set(OP_SEQ_FIELD, 0L)
+                .set(LOCKED_BY_FIELD, (String) null)
+                .set(LOCKED_AT_FIELD, (Long) null)
+                .set(LAST_SERVER_FIELD, (String) null)
+                .set(LAST_UPDATED_FIELD, 0L)
+                .onDuplicateKeyIgnore()
+                .execute();
         }
     }
 
@@ -218,20 +293,23 @@ public class DatabaseManager {
      * Returns VersionedData.EMPTY if no data exists or data is empty.
      */
     public VersionedData loadData(UUID uuid) throws SQLException {
-        String sql = String.format(
-            "SELECT data, version, checksum, fencing_token FROM `%s` WHERE uuid = ?", dataTable);
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setString(1, uuid.toString());
-            try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) {
-                    byte[] data = rs.getBytes("data");
-                    long version = rs.getLong("version");
-                    long checksum = rs.getLong("checksum");
-                    long fencingToken = rs.getLong("fencing_token");
-                    if (data != null && data.length > 0) {
-                        return new VersionedData(data, version, checksum, fencingToken);
-                    }
+        try (Connection conn = dataSource.getConnection()) {
+            Record record = dsl(conn)
+                .select(DATA_FIELD, VERSION_FIELD, CHECKSUM_FIELD, FENCING_TOKEN_FIELD)
+                .from(playerData)
+                .where(UUID_FIELD.eq(uuid.toString()))
+                .fetchOne();
+
+            if (record != null) {
+                byte[] data = record.get(DATA_FIELD);
+                // version/checksum/fencing_token are NOT NULL columns, so the
+                // boxed Long values are never null here (auto-unboxing is safe).
+                if (data != null && data.length > 0) {
+                    return new VersionedData(
+                        data,
+                        record.get(VERSION_FIELD),
+                        record.get(CHECKSUM_FIELD),
+                        record.get(FENCING_TOKEN_FIELD));
                 }
             }
         }
@@ -274,21 +352,19 @@ public class DatabaseManager {
         // - version = expectedVersion: optimistic concurrency (row not modified since load)
         // - fencing_token <= fencingToken: the writer's lock is not stale
         //   (a newer lock holder would have a higher stored fencing_token, rejecting us)
-        String sql = String.format("""
-            UPDATE `%s` SET data = ?, version = version + 1, checksum = ?,
-            locked_by = NULL, locked_at = NULL, last_server = ?, last_updated = ?
-            WHERE uuid = ? AND version = ? AND fencing_token <= ?
-            """, dataTable);
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setBytes(1, data);
-            ps.setLong(2, checksum);
-            ps.setString(3, serverName);
-            ps.setLong(4, now);
-            ps.setString(5, uuid.toString());
-            ps.setLong(6, expectedVersion);
-            ps.setLong(7, fencingToken);
-            return ps.executeUpdate() > 0;
+        try (Connection conn = dataSource.getConnection()) {
+            return dsl(conn).update(playerData)
+                .set(DATA_FIELD, data)
+                .set(VERSION_FIELD, VERSION_FIELD.plus(1))
+                .set(CHECKSUM_FIELD, checksum)
+                .set(LOCKED_BY_FIELD, (String) null)
+                .set(LOCKED_AT_FIELD, (Long) null)
+                .set(LAST_SERVER_FIELD, serverName)
+                .set(LAST_UPDATED_FIELD, now)
+                .where(UUID_FIELD.eq(uuid.toString())
+                    .and(VERSION_FIELD.eq(expectedVersion))
+                    .and(FENCING_TOKEN_FIELD.le(fencingToken)))
+                .execute() > 0;
         }
     }
 
@@ -297,17 +373,13 @@ public class DatabaseManager {
      * Used for conflict diagnosis (determining if a stale lock holder tried to write).
      */
     public long getCurrentFencingToken(UUID uuid) throws SQLException {
-        String sql = String.format("SELECT fencing_token FROM `%s` WHERE uuid = ?", dataTable);
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setString(1, uuid.toString());
-            try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) {
-                    return rs.getLong("fencing_token");
-                }
-            }
+        try (Connection conn = dataSource.getConnection()) {
+            Long token = dsl(conn).select(FENCING_TOKEN_FIELD)
+                .from(playerData)
+                .where(UUID_FIELD.eq(uuid.toString()))
+                .fetchOne(FENCING_TOKEN_FIELD);
+            return token != null ? token : -1;
         }
-        return -1;
     }
 
     /**
@@ -320,6 +392,12 @@ public class DatabaseManager {
      * reads the connection-local value. This replaces the unsafe
      * {@code SELECT MAX(seq) ... FOR UPDATE} pattern which caused gap locks on the
      * operation_log index, blocking concurrent inserts for adjacent UUIDs.
+     *
+     * <p>jOOQ has no DSL equivalent for {@code LAST_INSERT_ID(expr)}, so the UPDATE is
+     * issued as raw SQL via {@link DSLContext#execute(String, Object...)} and the
+     * connection-local value is read back with {@link DSLContext#fetchValue(String)}.
+     * Both run on the same borrowed connection so the session-local
+     * {@code LAST_INSERT_ID()} is the one we just set.
      *
      * <p>InnoDB locking rules followed:
      * <ol>
@@ -336,24 +414,17 @@ public class DatabaseManager {
         ensurePlayerExists(uuid);
 
         try (Connection conn = dataSource.getConnection()) {
+            DSLContext dsl = dsl(conn);
+
             // Atomically increment op_seq and set it as LAST_INSERT_ID for this connection
             String updateSql = String.format(
                 "UPDATE `%s` SET op_seq = LAST_INSERT_ID(op_seq + 1) WHERE uuid = ?", dataTable);
-            try (PreparedStatement ps = conn.prepareStatement(updateSql)) {
-                ps.setString(1, uuid.toString());
-                ps.executeUpdate();
-            }
+            dsl.execute(updateSql, uuid.toString());
 
             // Read back the connection-local LAST_INSERT_ID (no extra DB round-trip for locking)
-            try (PreparedStatement ps = conn.prepareStatement("SELECT LAST_INSERT_ID()")) {
-                try (ResultSet rs = ps.executeQuery()) {
-                    if (rs.next()) {
-                        return rs.getLong(1);
-                    }
-                }
-            }
+            Object result = dsl.fetchValue("SELECT LAST_INSERT_ID()");
+            return result != null ? ((Number) result).longValue() : 1;
         }
-        return 1;
     }
 
     /**
@@ -361,33 +432,26 @@ public class DatabaseManager {
      * Used for conflict diagnosis.
      */
     public long getCurrentVersion(UUID uuid) throws SQLException {
-        String sql = String.format("SELECT version FROM `%s` WHERE uuid = ?", dataTable);
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setString(1, uuid.toString());
-            try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) {
-                    return rs.getLong("version");
-                }
-            }
+        try (Connection conn = dataSource.getConnection()) {
+            Long version = dsl(conn).select(VERSION_FIELD)
+                .from(playerData)
+                .where(UUID_FIELD.eq(uuid.toString()))
+                .fetchOne(VERSION_FIELD);
+            return version != null ? version : -1;
         }
-        return -1;
     }
 
     /**
      * Release the lock without saving data (e.g., on error).
      */
     public void releaseLock(UUID uuid, String serverName) throws SQLException {
-        String sql = String.format("""
-            UPDATE `%s` SET locked_by = NULL, locked_at = NULL
-            WHERE uuid = ? AND (locked_by = ? OR locked_by IS NULL)
-            """, dataTable);
-
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setString(1, uuid.toString());
-            ps.setString(2, serverName);
-            ps.executeUpdate();
+        try (Connection conn = dataSource.getConnection()) {
+            dsl(conn).update(playerData)
+                .set(LOCKED_BY_FIELD, (String) null)
+                .set(LOCKED_AT_FIELD, (Long) null)
+                .where(UUID_FIELD.eq(uuid.toString())
+                    .and(LOCKED_BY_FIELD.eq(serverName).or(LOCKED_BY_FIELD.isNull())))
+                .execute();
         }
     }
 
@@ -396,20 +460,12 @@ public class DatabaseManager {
      * Returns null if not locked.
      */
     public String getLockHolder(UUID uuid) throws SQLException {
-        String sql = String.format("""
-            SELECT locked_by FROM `%s` WHERE uuid = ?
-            """, dataTable);
-
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setString(1, uuid.toString());
-            try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) {
-                    return rs.getString("locked_by");
-                }
-            }
+        try (Connection conn = dataSource.getConnection()) {
+            return dsl(conn).select(LOCKED_BY_FIELD)
+                .from(playerData)
+                .where(UUID_FIELD.eq(uuid.toString()))
+                .fetchOne(LOCKED_BY_FIELD);
         }
-        return null;
     }
 
     /**
@@ -424,14 +480,19 @@ public class DatabaseManager {
 
     /**
      * Check if the connection pool is healthy.
+     *
+     * <p>Issues a {@code SELECT 1} via jOOQ instead of {@link Connection#isValid(int)}
+     * so the health probe exercises the same jOOQ execution path as real queries.
+     * Both {@link SQLException} (pool/connection failures) and
+     * {@link DataAccessException} (jOOQ-wrapped SQL errors) are treated as unhealthy.
      */
     public boolean isHealthy() {
         if (dataSource == null || dataSource.isClosed()) {
             return false;
         }
         try (Connection conn = dataSource.getConnection()) {
-            return conn.isValid(5);
-        } catch (SQLException e) {
+            return dsl(conn).fetchValue("SELECT 1") != null;
+        } catch (SQLException | DataAccessException e) {
             return false;
         }
     }

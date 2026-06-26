@@ -24,12 +24,11 @@ val paperVersion: String = property("paper.version") as String
 // =============================================================================
 //
 // Strategy:
-//   - Sparrow libraries (not on Maven Central) → implementation, shaded into
-//     the JAR by the shadowJar task. No relocation needed since FastSync is
-//     the only consumer.
-//   - Maven Central libraries (HikariCP, Lettuce, Caffeine, etc.) → compileOnly
-//     for compilation; declared in plugin.yml `libraries:` so Paper downloads
-//     them automatically at startup.
+//   - Sparrow-NBT / Sparrow-YAML (not on Maven Central) → implementation,
+//     shaded into the JAR by the shadowJar task.
+//   - Maven Central libraries (Redisson, Chronicle Queue, jOOQ, HikariCP, etc.)
+//     → compileOnly for compilation; declared in plugin.yml `libraries:` so
+//     Paper downloads them automatically at startup.
 //   - Paper API → compileOnly (provided by the server).
 // =============================================================================
 dependencies {
@@ -50,15 +49,20 @@ dependencies {
     compileOnly("com.zaxxer:HikariCP:7.1.0")
     compileOnly("at.yawk.lz4:lz4-java:1.11.0")
     compileOnly("com.mysql:mysql-connector-j:9.7.0")
-    compileOnly("io.lettuce:lettuce-core:7.6.0.RELEASE")
+    // Redis coordination: Redisson replaces Lettuce + sparrow-redis-message-broker.
+    // Provides RFencedLock, RTopic (Pub/Sub), RStream (Streams) in one library.
+    compileOnly("org.redisson:redisson:4.6.1")
+    // Local append-only player operation journal (replaces SQL operation_log table).
+    compileOnly("net.openhft:chronicle-queue:2026.4")
+    // Type-safe SQL DSL for OCC + fencing token CAS queries.
+    compileOnly("org.jooq:jooq:3.21.6")
     compileOnly("com.github.ben-manes.caffeine:caffeine:3.2.4")
     compileOnly("org.reactivestreams:reactive-streams:1.0.4")
 
-    // Sparrow libraries: shaded into the JAR (not on Maven Central, so Paper
-    // cannot auto-download them).
+    // Sparrow libraries: shaded into the JAR (not on Maven Central).
+    // sparrow-redis-message-broker removed — replaced by Redisson.
     implementation("net.momirealms:sparrow-nbt:0.18.8")
     implementation("net.momirealms:sparrow-yaml:1.0.7")
-    implementation("net.momirealms:sparrow-redis-message-broker:0.0.7")
 
     // Test
     testImplementation(platform("org.junit:junit-bom:6.1.0"))
@@ -82,7 +86,9 @@ dependencies {
     testImplementation("com.zaxxer:HikariCP:7.1.0")
     testImplementation("at.yawk.lz4:lz4-java:1.11.0")
     testImplementation("com.mysql:mysql-connector-j:9.7.0")
-    testImplementation("io.lettuce:lettuce-core:7.6.0.RELEASE")
+    testImplementation("org.redisson:redisson:4.6.1")
+    testImplementation("net.openhft:chronicle-queue:2026.4")
+    testImplementation("org.jooq:jooq:3.21.6")
     testImplementation("com.github.ben-manes.caffeine:caffeine:3.2.4")
     testImplementation("org.reactivestreams:reactive-streams:1.0.4")
 }

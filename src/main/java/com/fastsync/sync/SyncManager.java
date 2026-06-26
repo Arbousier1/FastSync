@@ -13,12 +13,11 @@ import com.fastsync.database.DatabaseManager;
 import com.fastsync.database.LockResult;
 import com.fastsync.database.VersionedData;
 import com.fastsync.log.OperationLog;
-import com.fastsync.log.OperationLogManager;
+import com.fastsync.log.ChronicleQueueLogManager;
 import com.fastsync.log.OperationType;
-import com.fastsync.redis.RedisManager;
+import com.fastsync.redis.RedissonManager;
 import com.fastsync.redis.stream.StreamEvent;
 import com.fastsync.redis.stream.StreamEventType;
-import com.fastsync.redis.stream.StreamManager;
 import com.fastsync.util.SchedulerUtil;
 import com.fastsync.serialization.CompressionUtil;
 import com.fastsync.serialization.PlayerDataSerializer;
@@ -70,11 +69,10 @@ public class SyncManager {
     private final Logger logger;
 
     private AsyncExecutor asyncExecutor;
-    private RedisManager redisManager;
+    private RedissonManager redissonManager;
     private SnapshotManager snapshotManager;
     private ConflictManager conflictManager;
-    private OperationLogManager operationLogManager;
-    private StreamManager streamManager;
+    private ChronicleQueueLogManager operationLogManager;
 
     // Dynamo-style p99.9 latency tracking
     private LatencyTracker loadLatency;
@@ -120,43 +118,39 @@ public class SyncManager {
             logger.info("Snapshot/backup system enabled (max " + config.getMaxSnapshots() + " per player).");
         }
 
-        // Initialize Redis if enabled
+        // Initialize Redis if enabled (Redisson: Pub/Sub + Streams unified)
         if (config.isRedisEnabled()) {
             try {
-                redisManager = new RedisManager(logger, config, config.getServerName());
-                redisManager.initialize();
-                logger.info("Redis lock coordination enabled.");
+                redissonManager = new RedissonManager(
+                    config.getRedisHost(), config.getRedisPort(),
+                    config.getRedisPassword(), config.getRedisDatabase(),
+                    config.getServerName());
+                redissonManager.initialize();
+                // Register listener for incoming stream events from other servers
+                redissonManager.addListener(this::handleStreamEvent);
+                logger.info("Redis coordination enabled (Redisson: Pub/Sub + Streams).");
             } catch (Exception e) {
                 logger.log(Level.SEVERE, "Failed to connect to Redis! Falling back to database polling.", e);
-                redisManager = null;
+                redissonManager = null;
             }
         } else {
             logger.info("Redis not enabled, using database polling for lock coordination.");
         }
 
-        // Initialize Redis Streams for critical, recoverable event delivery
-        if (config.isRedisEnabled() && config.isStreamsEnabled() && redisManager != null) {
-            try {
-                streamManager = new StreamManager(logger, config, config.getServerName());
-                streamManager.initialize();
-                // Register listener for incoming events from other servers
-                streamManager.addListener(this::handleStreamEvent);
-                logger.info("Redis Streams enabled (critical event delivery).");
-            } catch (Exception e) {
-                logger.log(Level.WARNING, "Failed to initialize Redis Streams. Continuing without stream support.", e);
-                streamManager = null;
-            }
-        }
-
         // Initialize conflict manager (Dynamo-style conflict recovery)
         conflictManager = new ConflictManager(logger, config, snapshotManager);
 
-        // Initialize operation log (Raft-inspired per-UUID ordered log)
-        operationLogManager = new OperationLogManager(logger, config);
-        try {
-            operationLogManager.initialize(databaseManager.getDataSource(), databaseManager);
-        } catch (SQLException e) {
-            logger.log(Level.WARNING, "Failed to initialize operation log", e);
+        // Initialize operation log (Chronicle Queue: local append-only journal)
+        if (config.isOperationLogEnabled()) {
+            try {
+                operationLogManager = new ChronicleQueueLogManager(
+                    plugin.getDataFolder().toPath(), config.getOperationLogRetention());
+                operationLogManager.initialize();
+                logger.info("Operation log enabled (Chronicle Queue, retention=" +
+                    config.getOperationLogRetention() + " per player).");
+            } catch (Exception e) {
+                logger.log(Level.WARNING, "Failed to initialize operation log (Chronicle Queue)", e);
+            }
         }
 
         // Initialize latency trackers (Dynamo p99.9 SLA focus)
@@ -215,8 +209,8 @@ public class SyncManager {
 
                 // If Redis is available, wait for real-time RELEASED notification
                 // instead of blindly sleeping
-                if (redisManager != null && redisManager.isHealthy()) {
-                    boolean released = redisManager.waitForLockRelease(uuid, config.getLockRetryIntervalMs());
+                if (redissonManager != null && redissonManager.isHealthy()) {
+                    boolean released = redissonManager.waitForLockRelease(uuid, config.getLockRetryIntervalMs());
                     if (released && config.isDebug()) {
                         logger.info("Received lock release notification for " + uuid);
                     }
@@ -614,8 +608,8 @@ public class SyncManager {
      * No-op if Redis is not enabled.
      */
     private void notifyLockReleased(UUID uuid) {
-        if (redisManager != null && redisManager.isHealthy()) {
-            redisManager.notifyLockReleased(uuid);
+        if (redissonManager != null && redissonManager.isHealthy()) {
+            redissonManager.notifyLockReleased(uuid);
         }
     }
 
@@ -1044,16 +1038,16 @@ public class SyncManager {
         // Wait for pending saves first
         waitForPendingSaves(5000);
 
-        // Close Redis Streams (publishes SERVER_STOP event)
-        if (streamManager != null) {
-            streamManager.close();
-            streamManager = null;
+        // Close Redis (Redisson: Pub/Sub + Streams unified, publishes SERVER_STOP)
+        if (redissonManager != null) {
+            redissonManager.close();
+            redissonManager = null;
         }
 
-        // Close Redis pub/sub
-        if (redisManager != null) {
-            redisManager.close();
-            redisManager = null;
+        // Close operation log (Chronicle Queue)
+        if (operationLogManager != null) {
+            operationLogManager.close();
+            operationLogManager = null;
         }
 
         // Shut down thread pool
@@ -1121,11 +1115,11 @@ public class SyncManager {
     }
 
     public boolean isRedisHealthy() {
-        return redisManager != null && redisManager.isHealthy();
+        return redissonManager != null && redissonManager.isHealthy();
     }
 
     public boolean isRedisEnabled() {
-        return redisManager != null && redisManager.isHealthy();
+        return redissonManager != null && redissonManager.isHealthy();
     }
 
     public int getAsyncActiveCount() {
@@ -1142,7 +1136,7 @@ public class SyncManager {
      */
     private void logOperation(UUID uuid, OperationType type, long fencingToken,
                               long version, int dataSize, String detail) {
-        if (operationLogManager != null && operationLogManager.isEnabled()) {
+        if (operationLogManager != null) {
             OperationLog log = OperationLog.create(uuid, type, config.getServerName(),
                 fencingToken, version, dataSize, detail);
             operationLogManager.append(log)
@@ -1158,12 +1152,12 @@ public class SyncManager {
      * Query the operation history for a player.
      */
     public List<OperationLog> queryOperationLog(UUID uuid, int limit) {
-        if (operationLogManager == null || !operationLogManager.isEnabled()) {
+        if (operationLogManager == null) {
             return List.of();
         }
         try {
             return operationLogManager.queryHistory(uuid, limit);
-        } catch (SQLException e) {
+        } catch (Exception e) {
             logger.log(Level.WARNING, "Failed to query operation log for " + uuid, e);
             return List.of();
         }
@@ -1173,7 +1167,7 @@ public class SyncManager {
 
     /**
      * Handle a critical stream event from another server.
-     * This is called by the StreamManager's consumer thread.
+     * This is called by the RedissonManager's consumer thread.
      */
     private void handleStreamEvent(StreamEvent event) {
         switch (event.type()) {
@@ -1215,8 +1209,8 @@ public class SyncManager {
      * Publish a PLAYER_CHECKOUT event when player data is saved and lock released.
      */
     private void publishCheckout(UUID uuid, long version, long fencingToken, String cause) {
-        if (streamManager != null) {
-            streamManager.publish(StreamEvent.create(
+        if (redissonManager != null) {
+            redissonManager.publish(StreamEvent.create(
                 StreamEventType.PLAYER_CHECKOUT, uuid, config.getServerName(),
                 "", version, fencingToken, "cause=" + cause));
         }
@@ -1226,8 +1220,8 @@ public class SyncManager {
      * Publish a PLAYER_CHECKIN event when player data is loaded and lock acquired.
      */
     private void publishCheckin(UUID uuid, long version, long fencingToken) {
-        if (streamManager != null) {
-            streamManager.publish(StreamEvent.create(
+        if (redissonManager != null) {
+            redissonManager.publish(StreamEvent.create(
                 StreamEventType.PLAYER_CHECKIN, uuid, config.getServerName(),
                 "", version, fencingToken, "Player loaded"));
         }
