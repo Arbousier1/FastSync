@@ -221,6 +221,9 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                 }
                 // Restart heartbeat task — interval may have changed
                 restartHeartbeatTask();
+                // Reset protection mode on reload — gives operator a way to
+                // recover without restarting the server
+                syncManager.resetProtectionMode();
                 sender.sendMessage(ChatColor.GREEN + "[FastSync] Configuration reloaded.");
                 sender.sendMessage(ChatColor.GRAY + "Server: " + configManager.getServerName());
                 sender.sendMessage(ChatColor.GRAY + "Compression: " +
@@ -367,6 +370,8 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         sender.sendMessage(ChatColor.YELLOW + "Pending loads: " + ChatColor.WHITE + syncManager.getPendingCount());
         sender.sendMessage(ChatColor.YELLOW + "Pending saves: " + ChatColor.WHITE + syncManager.getPendingSaveCount());
         sender.sendMessage(ChatColor.YELLOW + "Quarantined: " + ChatColor.WHITE + syncManager.getQuarantinedPlayerCount());
+        sender.sendMessage(ChatColor.YELLOW + "Protection mode: " +
+            (syncManager.isProtectionMode() ? ChatColor.RED + "ACTIVE (DB failures detected)" : ChatColor.GREEN + "Off"));
         sender.sendMessage(ChatColor.YELLOW + "Heartbeat: " + ChatColor.WHITE +
             "every " + configManager.getHeartbeatIntervalSeconds() + "s" +
             " (lock-timeout=" + configManager.getLockTimeout() + "s)");

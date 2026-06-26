@@ -544,7 +544,7 @@ public class DatabaseManager {
         long now = System.currentTimeMillis();
 
         // Use raw JDBC for batch — jOOQ's batch API is more verbose for this use case
-        String sql = "UPDATE " + tablePrefix + "player_data"
+        String sql = "UPDATE `" + dataTable + "`"
             + " SET locked_at = ?"
             + " WHERE uuid = ? AND locked_by = ? AND fencing_token = ?";
 
@@ -562,7 +562,11 @@ public class DatabaseManager {
             int[] results = ps.executeBatch();
             int i = 0;
             for (UUID uuid : playersToRefresh.keySet()) {
-                if (i < results.length && results[i] == 0) {
+                // EXECUTE_FAILED (-3) means the driver couldn't execute this
+                // particular statement in the batch. Treat it as a failure.
+                if (i >= results.length
+                    || results[i] == java.sql.Statement.EXECUTE_FAILED
+                    || results[i] == 0) {
                     failedPlayers.add(uuid);
                 }
                 i++;

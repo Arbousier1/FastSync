@@ -112,6 +112,15 @@ public class SyncManager {
     // when DB latency causes the previous cycle to exceed the interval.
     private final AtomicBoolean heartbeatRunning = new AtomicBoolean(false);
 
+    // Consecutive heartbeat failure counter. When the DB is unreachable,
+    // the heartbeat cycle throws SQLException. If this persists beyond
+    // HEARTBEAT_FAILURE_THRESHOLD consecutive cycles, the plugin enters
+    // protection mode: all active players are kicked to prevent them from
+    // playing with potentially expired locks.
+    private final AtomicInteger heartbeatFailureCount = new AtomicInteger(0);
+    private static final int HEARTBEAT_FAILURE_THRESHOLD = 3;
+    private volatile boolean protectionMode = false;
+
     // Track pending async saves for graceful shutdown
     private final AtomicInteger pendingSaveCount = new AtomicInteger(0);
     private final AtomicInteger pendingLoadCount = new AtomicInteger(0);
@@ -1560,8 +1569,20 @@ public class SyncManager {
             return;
         }
         try {
+            // Protection mode check: if we've had too many consecutive DB
+            // failures, kick all active players to prevent stale-lock play.
+            if (protectionMode) {
+                logger.log(Level.SEVERE, "[Heartbeat] Protection mode active — DB has been unreachable"
+                    + " for " + HEARTBEAT_FAILURE_THRESHOLD + "+ heartbeat cycles."
+                    + " Kicking all active players to prevent data corruption.");
+                kickAllActivePlayers();
+                return;
+            }
+
             String serverName = config.getServerName();
             if (activePlayers.isEmpty()) {
+                // Reset failure count when no players are online
+                heartbeatFailureCount.set(0);
                 return;
             }
 
@@ -1575,14 +1596,18 @@ public class SyncManager {
             }
 
             if (playersToRefresh.isEmpty()) {
+                heartbeatFailureCount.set(0);
                 return;
             }
 
-            // Batch refresh: single connection, single PreparedStatement
+            // Track whether the entire batch failed (DB unreachable)
+            boolean batchFailed = false;
             java.util.Set<UUID> failedPlayers = new java.util.HashSet<>();
+
             try {
                 databaseManager.refreshLockBatch(playersToRefresh, serverName, failedPlayers);
             } catch (SQLException e) {
+                batchFailed = true;
                 logger.log(Level.WARNING, "[Heartbeat] Batch refresh failed; falling back to per-player", e);
                 // Fallback: per-player refresh
                 for (java.util.Map.Entry<UUID, Long> entry : playersToRefresh.entrySet()) {
@@ -1592,9 +1617,28 @@ public class SyncManager {
                         }
                     } catch (SQLException ex) {
                         logger.log(Level.WARNING, "[Heartbeat] Per-player refresh failed for " + entry.getKey(), ex);
+                        failedPlayers.add(entry.getKey());
                     }
                 }
             }
+
+            // If the batch failed AND most players failed per-player fallback,
+            // the DB is likely unreachable. Increment failure counter.
+            if (batchFailed && failedPlayers.size() == playersToRefresh.size()) {
+                int failures = heartbeatFailureCount.incrementAndGet();
+                logger.log(Level.WARNING, "[Heartbeat] DB unreachable — heartbeat failure count: "
+                    + failures + "/" + HEARTBEAT_FAILURE_THRESHOLD);
+                if (failures >= HEARTBEAT_FAILURE_THRESHOLD) {
+                    protectionMode = true;
+                    logger.log(Level.SEVERE, "[Heartbeat] Entering protection mode after "
+                        + failures + " consecutive DB failures. All players will be kicked.");
+                    kickAllActivePlayers();
+                }
+                return; // Skip per-player quarantine — it's a DB issue, not a lock issue
+            }
+
+            // DB is reachable — reset failure counter
+            heartbeatFailureCount.set(0);
 
             // Handle failed players — quarantine and kick
             for (UUID uuid : failedPlayers) {
@@ -1617,6 +1661,27 @@ public class SyncManager {
         } finally {
             heartbeatRunning.set(false);
         }
+    }
+
+    /**
+     * Kick all active players — used when entering protection mode (DB unreachable
+     * for too long, locks may have expired).
+     */
+    private void kickAllActivePlayers() {
+        java.util.Set<UUID> toKick = new java.util.HashSet<>(activePlayers.keySet());
+        for (UUID uuid : toKick) {
+            quarantinedPlayers.add(uuid);
+            activePlayers.remove(uuid);
+            kickPlayerForLockLoss(uuid);
+        }
+    }
+
+    /**
+     * Reset protection mode — called when the DB recovers or the plugin reloads.
+     */
+    public void resetProtectionMode() {
+        protectionMode = false;
+        heartbeatFailureCount.set(0);
     }
 
     /**
@@ -2084,6 +2149,16 @@ public class SyncManager {
      */
     public int getActivePlayerCount() {
         return activePlayers.size();
+    }
+
+    /**
+     * Returns true if the plugin is in protection mode (DB has been unreachable
+     * for too many consecutive heartbeat cycles). In this mode, all active
+     * players are kicked to prevent them from playing with potentially expired
+     * locks. Use /fastsync reload to reset.
+     */
+    public boolean isProtectionMode() {
+        return protectionMode;
     }
 
     public boolean isRedisHealthy() {
