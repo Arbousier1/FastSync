@@ -94,6 +94,11 @@ public class SyncManager {
     private final AtomicInteger pendingSaveCount = new AtomicInteger(0);
     private final AtomicInteger pendingLoadCount = new AtomicInteger(0);
 
+    // Cached Bukkit registries (immutable for the server lifetime) to avoid
+    // re-iterating Bukkit.advancementIterator()/Attribute.values() on every save.
+    private volatile org.bukkit.advancement.Advancement[] cachedAdvancements;
+    private volatile Attribute[] cachedAttributes;
+
     public SyncManager(FastSync plugin, ConfigManager config, DatabaseManager databaseManager) {
         this.plugin = plugin;
         this.config = config;
@@ -447,6 +452,11 @@ public class SyncManager {
             applyAttributes(player, data);
         }
 
+        // Persistent Data Container
+        if (config.isSyncPDC()) {
+            applyPDC(player, data);
+        }
+
         // Location (optional)
         if (config.isSyncLocation() && data.getWorldName() != null) {
             try {
@@ -561,8 +571,11 @@ public class SyncManager {
 
                     if (saveLatency != null) saveLatency.recordError();
                 } else {
-                    // Success - create snapshot if enabled (backup system)
-                    if (snapshotManager != null) {
+                    // Success - create snapshot only when configured to do so on save.
+                    // Conflict-driven snapshots (in ConflictManager) are always created
+                    // regardless of this setting, so defaulting to "never" still keeps
+                    // conflict-recovery snapshots while eliminating save write amplification.
+                    if (snapshotManager != null && "always".equals(config.getSnapshotSaveTrigger())) {
                         snapshotManager.createSnapshot(uuid, compressed, data.getSaveCause())
                             .thenRun(() -> snapshotManager.pruneSnapshots(uuid, config.getMaxSnapshots()));
                     }
@@ -629,13 +642,15 @@ public class SyncManager {
             data.setFencingToken(fencingToken);
         }
 
-        // Inventory
-        data.setInventory(player.getInventory().getContents());
-        data.setArmor(player.getInventory().getArmorContents());
-        data.setOffhand(player.getInventory().getItemInOffHand());
+        // Inventory - normalize empty/AIR slots to null so the serializer can treat
+        // them uniformly and avoid storing meaningless AIR ItemStacks (sparse storage).
+        data.setInventory(sparseContents(player.getInventory().getContents()));
+        data.setArmor(sparseContents(player.getInventory().getArmorContents()));
+        org.bukkit.inventory.ItemStack offhand = player.getInventory().getItemInOffHand();
+        data.setOffhand(offhand != null && offhand.getType() == org.bukkit.Material.AIR ? null : offhand);
 
         // Ender chest
-        data.setEnderChest(player.getEnderChest().getContents());
+        data.setEnderChest(sparseContents(player.getEnderChest().getContents()));
 
         // Vitals
         data.setHealth(player.getHealth());
@@ -708,15 +723,23 @@ public class SyncManager {
     private void collectAdvancements(Player player, PlayerData data) {
         try {
             Map<String, Map<String, Long>> advancements = new HashMap<>();
-            java.util.Iterator<org.bukkit.advancement.Advancement> it = Bukkit.advancementIterator();
-            while (it.hasNext()) {
-                org.bukkit.advancement.Advancement adv = it.next();
+            // The set of registered advancements is immutable for the server lifetime,
+            // so cache it after the first collection instead of re-iterating every save.
+            if (cachedAdvancements == null) {
+                List<org.bukkit.advancement.Advancement> list = new ArrayList<>();
+                java.util.Iterator<org.bukkit.advancement.Advancement> it = Bukkit.advancementIterator();
+                while (it.hasNext()) list.add(it.next());
+                cachedAdvancements = list.toArray(new org.bukkit.advancement.Advancement[0]);
+            }
+            for (org.bukkit.advancement.Advancement adv : cachedAdvancements) {
                 org.bukkit.advancement.AdvancementProgress progress = player.getAdvancementProgress(adv);
                 if (progress == null) continue;
 
                 String key = adv.getKey().toString();
                 Map<String, Long> criteria = new HashMap<>();
                 for (String awarded : progress.getAwardedCriteria()) {
+                    // Note: Bukkit doesn't expose per-criteria award timestamps; using current
+                    // time as approximation. For precise timing, NMS-level hooks would be needed.
                     criteria.put(awarded, System.currentTimeMillis());
                 }
                 if (!criteria.isEmpty()) {
@@ -738,17 +761,39 @@ public class SyncManager {
                 try {
                     String categoryName = stat.getType().name();
                     String statName = stat.name();
-                    int value;
 
                     if (stat.getType() == Statistic.Type.UNTYPED) {
-                        value = player.getStatistic(stat);
-                    } else {
-                        // Skip typed statistics that require a material/entity parameter
-                        // for simplicity - these are harder to enumerate
-                        continue;
+                        int value = player.getStatistic(stat);
+                        statistics.computeIfAbsent(categoryName, k -> new HashMap<>()).put(statName, value);
+                    } else if (stat.getType() == Statistic.Type.ITEM) {
+                        Map<String, Integer> itemStats = statistics.computeIfAbsent("ITEM_" + statName, k -> new HashMap<>());
+                        for (org.bukkit.Material mat : org.bukkit.Material.values()) {
+                            if (mat.isItem()) {
+                                try {
+                                    int v = player.getStatistic(stat, mat);
+                                    if (v != 0) itemStats.put(mat.name(), v);
+                                } catch (Exception ignored) {}
+                            }
+                        }
+                    } else if (stat.getType() == Statistic.Type.BLOCK) {
+                        Map<String, Integer> blockStats = statistics.computeIfAbsent("BLOCK_" + statName, k -> new HashMap<>());
+                        for (org.bukkit.Material mat : org.bukkit.Material.values()) {
+                            if (mat.isBlock()) {
+                                try {
+                                    int v = player.getStatistic(stat, mat);
+                                    if (v != 0) blockStats.put(mat.name(), v);
+                                } catch (Exception ignored) {}
+                            }
+                        }
+                    } else if (stat.getType() == Statistic.Type.ENTITY) {
+                        Map<String, Integer> entityStats = statistics.computeIfAbsent("ENTITY_" + statName, k -> new HashMap<>());
+                        for (org.bukkit.entity.EntityType ent : org.bukkit.entity.EntityType.values()) {
+                            try {
+                                int v = player.getStatistic(stat, ent);
+                                if (v != 0) entityStats.put(ent.name(), v);
+                            } catch (Exception ignored) {}
+                        }
                     }
-
-                    statistics.computeIfAbsent(categoryName, k -> new HashMap<>()).put(statName, value);
                 } catch (Exception ignored) {
                     // Some stats throw on certain versions
                 }
@@ -764,7 +809,12 @@ public class SyncManager {
     private void collectAttributes(Player player, PlayerData data) {
         try {
             List<PlayerData.AttributeData> attributes = new ArrayList<>();
-            for (Attribute attr : Attribute.values()) {
+            // Attribute.values() is immutable for the server lifetime; cache it to
+            // avoid rebuilding the array on every save.
+            if (cachedAttributes == null) {
+                cachedAttributes = Attribute.values();
+            }
+            for (Attribute attr : cachedAttributes) {
                 try {
                     AttributeInstance instance = player.getAttribute(attr);
                     if (instance == null) continue;
@@ -797,18 +847,37 @@ public class SyncManager {
     }
 
     private void collectPDC(Player player, PlayerData data) {
-        // TODO: Bukkit's PersistentDataContainer API does not expose a way to enumerate
-        // the keys stored on a holder, so there is no reliable way to serialize the
-        // player's full PDC here. The previous implementation only stuffed a dummy
-        // marker entry ("__pdc__" -> serialized {"__pdc_serialized__": true}) which
-        // carried no real data, so it has been removed.
-        //
-        // Real PDC synchronization would require a custom PDC registry where plugins
-        // register the NamespacedKeys they want synchronized; only those known keys
-        // could then be read via PersistentDataContainer#get(NamespacedKey, ...) and
-        // serialized. Until such a registry exists, we intentionally store an empty
-        // map instead of a misleading placeholder.
-        data.setPersistentDataContainer(new HashMap<>());
+        try {
+            // Paper/CraftBukkit's PersistentDataContainer implementation has a
+            // serializeToBytes() method, but it's not exposed in the Bukkit API.
+            // We use reflection to access it, with a fallback to empty if unavailable.
+            org.bukkit.persistence.PersistentDataContainer pdc = player.getPersistentDataContainer();
+            if (pdc == null || pdc.isEmpty()) {
+                data.setPersistentDataContainer(new HashMap<>());
+                return;
+            }
+            java.lang.reflect.Method serialize = pdc.getClass().getMethod("serializeToBytes");
+            serialize.setAccessible(true);
+            byte[] bytes = (byte[]) serialize.invoke(pdc);
+            if (bytes != null && bytes.length > 0) {
+                Map<String, byte[]> pdcMap = new HashMap<>();
+                pdcMap.put("__pdc_bytes__", bytes);
+                data.setPersistentDataContainer(pdcMap);
+            } else {
+                data.setPersistentDataContainer(new HashMap<>());
+            }
+        } catch (NoSuchMethodException e) {
+            // Paper version doesn't have serializeToBytes - PDC sync unavailable
+            if (config.isDebug()) {
+                logger.fine("[PDC] serializeToBytes not available, PDC sync disabled");
+            }
+            data.setPersistentDataContainer(new HashMap<>());
+        } catch (Exception e) {
+            if (config.isDebug()) {
+                logger.warning("Failed to collect PDC: " + e.getMessage());
+            }
+            data.setPersistentDataContainer(new HashMap<>());
+        }
     }
 
     // ==================== Data Apply Helpers ====================
@@ -843,13 +912,45 @@ public class SyncManager {
     private void applyStatistics(Player player, PlayerData data) {
         try {
             for (Map.Entry<String, Map<String, Integer>> cat : data.getStatistics().entrySet()) {
-                for (Map.Entry<String, Integer> stat : cat.getValue().entrySet()) {
-                    try {
-                        Statistic statistic = Statistic.valueOf(stat.getKey());
-                        if (statistic.getType() == Statistic.Type.UNTYPED) {
-                            player.setStatistic(statistic, stat.getValue());
+                String category = cat.getKey();
+                try {
+                    if (category.startsWith("ITEM_")) {
+                        Statistic statistic = Statistic.valueOf(category.substring("ITEM_".length()));
+                        for (Map.Entry<String, Integer> stat : cat.getValue().entrySet()) {
+                            try {
+                                org.bukkit.Material mat = org.bukkit.Material.matchMaterial(stat.getKey());
+                                if (mat != null) player.setStatistic(statistic, mat, stat.getValue());
+                            } catch (Exception ignored) {}
                         }
-                    } catch (Exception ignored) {}
+                    } else if (category.startsWith("BLOCK_")) {
+                        Statistic statistic = Statistic.valueOf(category.substring("BLOCK_".length()));
+                        for (Map.Entry<String, Integer> stat : cat.getValue().entrySet()) {
+                            try {
+                                org.bukkit.Material mat = org.bukkit.Material.matchMaterial(stat.getKey());
+                                if (mat != null) player.setStatistic(statistic, mat, stat.getValue());
+                            } catch (Exception ignored) {}
+                        }
+                    } else if (category.startsWith("ENTITY_")) {
+                        Statistic statistic = Statistic.valueOf(category.substring("ENTITY_".length()));
+                        for (Map.Entry<String, Integer> stat : cat.getValue().entrySet()) {
+                            try {
+                                org.bukkit.entity.EntityType ent = org.bukkit.entity.EntityType.valueOf(stat.getKey());
+                                player.setStatistic(statistic, ent, stat.getValue());
+                            } catch (Exception ignored) {}
+                        }
+                    } else {
+                        // Untyped statistics (category == stat.getType().name(), e.g. UNTYPED)
+                        for (Map.Entry<String, Integer> stat : cat.getValue().entrySet()) {
+                            try {
+                                Statistic statistic = Statistic.valueOf(stat.getKey());
+                                if (statistic.getType() == Statistic.Type.UNTYPED) {
+                                    player.setStatistic(statistic, stat.getValue());
+                                }
+                            } catch (Exception ignored) {}
+                        }
+                    }
+                } catch (Exception ignored) {
+                    // Unknown statistic name on this version
                 }
             }
         } catch (Exception e) {
@@ -893,6 +994,27 @@ public class SyncManager {
             }
         } catch (Exception e) {
             if (config.isDebug()) logger.warning("Failed to apply attributes: " + e.getMessage());
+        }
+    }
+
+    private void applyPDC(Player player, PlayerData data) {
+        // Restore the player's PersistentDataContainer from the serialized bytes
+        // captured by collectPDC(). Uses reflection to call CraftBukkit/Paper's
+        // deserializeBytes(byte[]) on the implementation class.
+        if (data.getPersistentDataContainer() == null || data.getPersistentDataContainer().isEmpty()) {
+            return;
+        }
+        byte[] pdcBytes = data.getPersistentDataContainer().get("__pdc_bytes__");
+        if (pdcBytes == null) {
+            return;
+        }
+        try {
+            org.bukkit.persistence.PersistentDataContainer pdc = player.getPersistentDataContainer();
+            java.lang.reflect.Method deserialize = pdc.getClass().getMethod("deserializeBytes", byte[].class);
+            deserialize.setAccessible(true);
+            deserialize.invoke(pdc, pdcBytes);
+        } catch (Exception e) {
+            if (config.isDebug()) logger.warning("Failed to apply PDC: " + e.getMessage());
         }
     }
 
@@ -1062,6 +1184,22 @@ public class SyncManager {
     }
 
     // ==================== Helpers ====================
+
+    /**
+     * Normalize an ItemStack[] so empty/AIR slots become null. The array length
+     * (and thus slot positions) is preserved; only AIR entries are cleared. This
+     * lets the serializer treat empty slots uniformly as null instead of storing
+     * meaningless AIR ItemStacks.
+     */
+    private org.bukkit.inventory.ItemStack[] sparseContents(org.bukkit.inventory.ItemStack[] contents) {
+        if (contents == null) return null;
+        for (int i = 0; i < contents.length; i++) {
+            if (contents[i] != null && contents[i].getType() == org.bukkit.Material.AIR) {
+                contents[i] = null;
+            }
+        }
+        return contents;
+    }
 
     private void setInventoryContents(Player player, org.bukkit.inventory.ItemStack[] contents) {
         org.bukkit.inventory.ItemStack[] current = player.getInventory().getContents();

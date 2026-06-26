@@ -162,11 +162,15 @@ public class DatabaseManager {
      * it, logging anything else as a migration note.
      */
     private void migrateSchema() throws SQLException {
-        // Add columns if they don't exist (MySQL 8+ supports IF NOT EXISTS)
+        // Add columns if they don't exist (MySQL 8+ supports IF NOT EXISTS).
+        // The trailing DROP COLUMN removes the orphaned `op_seq` column left over
+        // from old installations; MySQL 8+ honours DROP COLUMN IF NOT EXISTS, so it
+        // is a no-op on fresh installs (and on tables that never had the column).
         String[] migrations = {
             String.format("ALTER TABLE `%s` ADD COLUMN IF NOT EXISTS `version` BIGINT NOT NULL DEFAULT 0", dataTable),
             String.format("ALTER TABLE `%s` ADD COLUMN IF NOT EXISTS `checksum` BIGINT NOT NULL DEFAULT 0", dataTable),
-            String.format("ALTER TABLE `%s` ADD COLUMN IF NOT EXISTS `fencing_token` BIGINT NOT NULL DEFAULT 0", dataTable)
+            String.format("ALTER TABLE `%s` ADD COLUMN IF NOT EXISTS `fencing_token` BIGINT NOT NULL DEFAULT 0", dataTable),
+            String.format("ALTER TABLE `%s` DROP COLUMN IF NOT EXISTS `op_seq`", dataTable)
         };
         try (Connection conn = dataSource.getConnection()) {
             DSLContext dsl = dsl(conn);
@@ -174,8 +178,12 @@ public class DatabaseManager {
                 try {
                     dsl.execute(sql);
                 } catch (DataAccessException e) {
-                    // Column may already exist (MySQL versions that don't support IF NOT EXISTS)
-                    if (!isDuplicateColumnError(e)) {
+                    // ADD COLUMN: column may already exist on MySQL versions that
+                    // don't support IF NOT EXISTS. DROP COLUMN: the column may not
+                    // exist, or the server may not support DROP COLUMN IF NOT EXISTS.
+                    // Either way the cause chain is walked and benign cases are
+                    // suppressed; anything else is logged as a migration note.
+                    if (!isDuplicateColumnError(e) && !isCannotDropColumnError(e)) {
                         logger.warning("Schema migration note: " + e.getMessage());
                     }
                 }
@@ -201,6 +209,29 @@ public class DatabaseManager {
     }
 
     /**
+     * Walk the jOOQ exception cause chain looking for the MySQL error raised when
+     * attempting to drop a column that does not exist — either because the
+     * {@code DROP COLUMN IF NOT EXISTS} syntax is unsupported (older MySQL) or
+     * because the column was never present. MySQL surfaces this as error 1091
+     * ("Can't DROP ...; check that column/key exists"); some variants report an
+     * "Unknown column" error. Both are benign outcomes of the {@code op_seq}
+     * cleanup migration and are suppressed.
+     */
+    private static boolean isCannotDropColumnError(Throwable e) {
+        Throwable t = e;
+        while (t != null) {
+            String message = t.getMessage();
+            if (message != null && (message.contains("check that column/key exists")
+                    || message.contains("Can't DROP")
+                    || message.contains("Unknown column"))) {
+                return true;
+            }
+            t = t.getCause();
+        }
+        return false;
+    }
+
+    /**
      * Acquire a lock for a player's data and generate a fencing token.
      *
      * <p>Per Kleppmann's fencing token pattern: every successful lock acquisition
@@ -212,15 +243,36 @@ public class DatabaseManager {
      * <p>This is stronger than Redis SET NX PX locks, which cannot generate
      * fencing tokens and thus cannot defend against stale writes at the storage layer.
      *
-     * <p><b>InnoDB locking (per MySQL 8.4 docs):</b> The UPDATE uses
-     * {@code WHERE uuid = ?} which hits the PRIMARY KEY index — a single-row
-     * X lock with no gap locks or next-key locks. This is safe for high
-     * concurrency: different UUIDs never contend on the same index entry.
-     * The subsequent SELECT is also a PK point lookup (no index scan).
+     * <p><b>Implementation:</b> The former three roundtrips — a separate
+     * {@code INSERT IGNORE} to ensure the row exists, a conditional
+     * {@code UPDATE} to take the lock and bump the token, and a
+     * {@code SELECT} to read the token back — are collapsed into a single
+     * {@code INSERT ... ON DUPLICATE KEY UPDATE} plus one read-back SELECT on the
+     * same borrowed connection. The INSERT arm creates the row for brand-new
+     * players with {@code fencing_token = 1}; the ON DUPLICATE KEY UPDATE arm
+     * atomically increments {@code fencing_token} (via the
+     * {@code LAST_INSERT_ID(expr)} idiom) and rewrites
+     * {@code locked_by}/{@code locked_at} only when the lock is free, expired, or
+     * already held by this server — the same predicate the old conditional UPDATE
+     * used. The statement is issued as raw SQL via {@link DSLContext#execute(String)}
+     * because jOOQ's DSL does not express {@code ON DUPLICATE KEY UPDATE} with
+     * conditional {@code IF()} expressions cleanly.
      *
-     * <p>The UPDATE and the read-back SELECT run on a single borrowed connection
-     * so the fencing token we read is the one we just wrote (the row is now locked
-     * by this server, so no other server can bump the token in between).
+     * <p><b>InnoDB locking (per MySQL 8.4 docs):</b> The duplicate-key conflict is
+     * resolved on the PRIMARY KEY ({@code uuid}) — a single-row X lock with no gap
+     * locks or next-key locks, so different UUIDs never contend. The read-back
+     * SELECT is a PK point lookup.
+     *
+     * <p><b>Why the read-back checks {@code locked_by} rather than relying on
+     * {@code LAST_INSERT_ID()} alone:</b> The {@code LAST_INSERT_ID(expr)} idiom
+     * only sets the connection's last-insert ID when the UPDATE arm actually
+     * evaluates the expression. On a fresh INSERT (a new player) the UPDATE arm
+     * never runs, and on a pooled connection {@code LAST_INSERT_ID()} may still
+     * hold a stale value from a previous statement — so a zero return is not a
+     * reliable failure signal. The committed {@code locked_by} column is
+     * unambiguous: we hold the lock iff it equals {@code serverName}. Once we hold
+     * the lock no other server can bump the token before the read-back, so the
+     * {@code fencing_token} we read is the one we just wrote.
      *
      * @return LockResult with acquired=true and the fencing token, or acquired=false
      */
@@ -228,34 +280,54 @@ public class DatabaseManager {
         long now = System.currentTimeMillis();
         long expiredTime = now - (config.getLockTimeout() * 1000L);
 
-        // First, ensure the player row exists
-        ensurePlayerExists(uuid);
+        // Merge ensurePlayerExists (INSERT IGNORE) + conditional UPDATE into one
+        // INSERT ... ON DUPLICATE KEY UPDATE. The INSERT arm seeds a new player
+        // row (fencing_token = 1, locked_by = us); the UPDATE arm bumps the token
+        // and takes the lock only when it is free, expired, or already ours.
+        String sql = String.format("""
+            INSERT INTO `%s` (uuid, data, version, checksum, fencing_token, locked_by, locked_at, last_server, last_updated)
+            VALUES (?, '', 0, 0, 1, ?, ?, NULL, 0)
+            ON DUPLICATE KEY UPDATE
+                fencing_token = IF(locked_by IS NULL OR locked_at < ? OR locked_by = ?,
+                                   LAST_INSERT_ID(fencing_token + 1),
+                                   fencing_token),
+                locked_by = IF(locked_by IS NULL OR locked_at < ? OR locked_by = ?,
+                               ?,
+                               locked_by),
+                locked_at = IF(locked_by IS NULL OR locked_at < ? OR locked_by = ?,
+                               ?,
+                               locked_at)
+            """, dataTable);
 
-        // Atomically acquire lock AND increment fencing token, then read back the
-        // new token on the same connection.
         try (Connection conn = dataSource.getConnection()) {
             DSLContext dsl = dsl(conn);
 
-            int updated = dsl.update(playerData)
-                .set(LOCKED_BY_FIELD, serverName)
-                .set(LOCKED_AT_FIELD, now)
-                .set(FENCING_TOKEN_FIELD, FENCING_TOKEN_FIELD.plus(1))
-                .where(UUID_FIELD.eq(uuid.toString())
-                    .and(LOCKED_BY_FIELD.isNull()
-                        .or(LOCKED_AT_FIELD.lt(expiredTime))
-                        .or(LOCKED_BY_FIELD.eq(serverName))))
-                .execute();
+            dsl.execute(sql,
+                uuid.toString(),  // INSERT: uuid
+                serverName,       // INSERT: locked_by
+                now,              // INSERT: locked_at
+                expiredTime,      // fencing_token IF predicate
+                serverName,       // fencing_token IF predicate
+                expiredTime,      // locked_by IF predicate
+                serverName,       // locked_by IF predicate
+                serverName,       // locked_by new value
+                expiredTime,      // locked_at IF predicate
+                serverName,       // locked_at IF predicate
+                now               // locked_at new value
+            );
 
-            if (updated == 0) {
-                return LockResult.FAILED;
-            }
-
-            // Read back the new fencing token (PK point lookup, no locking needed)
-            Long token = dsl.select(FENCING_TOKEN_FIELD)
+            // Read back the committed fencing_token and lock owner on the same
+            // connection. We hold the lock iff locked_by == serverName; the
+            // fencing_token is the one we just wrote (PK point lookup).
+            Record record = dsl.select(FENCING_TOKEN_FIELD, LOCKED_BY_FIELD)
                 .from(playerData)
                 .where(UUID_FIELD.eq(uuid.toString()))
-                .fetchOne(FENCING_TOKEN_FIELD);
+                .fetchOne();
 
+            if (record == null || !serverName.equals(record.get(LOCKED_BY_FIELD))) {
+                return LockResult.FAILED;
+            }
+            Long token = record.get(FENCING_TOKEN_FIELD);
             return token != null ? LockResult.success(token) : LockResult.FAILED;
         }
     }

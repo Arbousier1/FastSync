@@ -73,6 +73,7 @@ public class ConfigManager {
     private String lockTimeoutKickMessage;
     private boolean periodicSave;
     private int periodicSaveIntervalSeconds;
+    private int periodicSaveBatchSize;
 
     // Sync - new features
     private boolean syncAdvancements;
@@ -87,6 +88,7 @@ public class ConfigManager {
     private boolean snapshotEnabled;
     private int maxSnapshots;
     private long snapshotBackupFrequencyMs;
+    private String snapshotSaveTrigger;
 
     // Death save
     private boolean saveOnDeath;
@@ -230,6 +232,7 @@ public class ConfigManager {
             "&c[FastSync] Your data is still being saved by another server.");
         periodicSave = source.getBoolean("sync.periodic-save", false);
         periodicSaveIntervalSeconds = source.getInt("sync.periodic-save-interval-seconds", 300);
+        periodicSaveBatchSize = source.getInt("sync.periodic-save-batch-size", 10);
 
         // Sync - new features
         syncAdvancements = source.getBoolean("sync.sync-advancements", true);
@@ -244,6 +247,7 @@ public class ConfigManager {
         snapshotEnabled = source.getBoolean("snapshot.enabled", true);
         maxSnapshots = source.getInt("snapshot.max-snapshots", 16);
         snapshotBackupFrequencyMs = source.getLong("snapshot.backup-frequency-ms", 14400000);
+        snapshotSaveTrigger = source.getString("snapshot.save-trigger", "never");
 
         // Death save
         saveOnDeath = source.getBoolean("sync.save-on-death", false);
@@ -326,6 +330,7 @@ public class ConfigManager {
     public String getLockTimeoutKickMessage() { return lockTimeoutKickMessage; }
     public boolean isPeriodicSave() { return periodicSave; }
     public int getPeriodicSaveIntervalSeconds() { return periodicSaveIntervalSeconds; }
+    public int getPeriodicSaveBatchSize() { return periodicSaveBatchSize; }
 
     public boolean isSyncAdvancements() { return syncAdvancements; }
     public boolean isSyncStatistics() { return syncStatistics; }
@@ -338,6 +343,7 @@ public class ConfigManager {
     public boolean isSnapshotEnabled() { return snapshotEnabled; }
     public int getMaxSnapshots() { return maxSnapshots; }
     public long getSnapshotBackupFrequencyMs() { return snapshotBackupFrequencyMs; }
+    public String getSnapshotSaveTrigger() { return snapshotSaveTrigger; }
 
     public boolean isSaveOnDeath() { return saveOnDeath; }
     public boolean isSaveOnWorldSave() { return saveOnWorldSave; }

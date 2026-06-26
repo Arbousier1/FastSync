@@ -106,6 +106,11 @@ sync:
   periodic-save: false
   periodic-save-interval-seconds: 300
 
+  # Batch size for periodic saves (number of players saved per tick).
+  # Lower this if the async executor pool is small; the async executor pool
+  # size should be >= this value to avoid queue flooding with many players.
+  periodic-save-batch-size: 10
+
   # ------------------------------------------------------------
   # Additional Sync Settings
   # ------------------------------------------------------------
@@ -146,6 +151,12 @@ snapshot:
 
   # Minimum time between snapshot creation in milliseconds (default: 4 hours)
   backup-frequency-ms: 14400000
+
+  # When to create a snapshot on a successful save.
+  #   "always" - create a snapshot on every successful save (high write amplification)
+  #   "never"  - (default) do not snapshot on save; conflict-driven snapshots created
+  #              unconditionally by ConflictManager are still kept.
+  save-trigger: "never"
 
 # ------------------------------------------------------------
 # Compression Settings

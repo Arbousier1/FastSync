@@ -106,6 +106,7 @@ public class RedissonManager {
     private RTopic lockTopic;
     private RStream<String, String> stream;
     private ExecutorService consumerExecutor;
+    private ExecutorService messageDispatcher;
     private final AtomicBoolean running = new AtomicBoolean(false);
 
     /**
@@ -173,6 +174,16 @@ public class RedissonManager {
             return t;
         });
         consumerExecutor.submit(this::consumeLoop);
+
+        // Dedicated dispatcher (2 threads) so a slow listener no longer blocks
+        // readGroup. The consume loop reads messages and immediately hands them
+        // off here; ACK happens in the dispatcher's completion handler so a
+        // crashed consumer can still recover the message via autoClaim.
+        messageDispatcher = Executors.newFixedThreadPool(2, r -> {
+            Thread t = new Thread(r, "FastSync-Stream-Dispatcher");
+            t.setDaemon(true);
+            return t;
+        });
 
         // Announce this server is up and ready to accept players.
         publish(StreamEvent.create(StreamEventType.SERVER_START, null, serverName,
@@ -362,8 +373,21 @@ public class RedissonManager {
                 }
 
                 for (Map.Entry<StreamMessageId, Map<String, String>> entry : messages.entrySet()) {
-                    handleStreamMessage(entry.getKey(), entry.getValue());
-                    stream.ack(CONSUMER_GROUP, entry.getKey());
+                    StreamMessageId msgId = entry.getKey();
+                    Map<String, String> body = entry.getValue();
+                    messageDispatcher.submit(() -> {
+                        try {
+                            handleStreamMessage(msgId, body);
+                        } catch (Exception e) {
+                            LOGGER.log(Level.WARNING, "[Redisson] Error dispatching stream message " + msgId, e);
+                        } finally {
+                            try {
+                                stream.ack(CONSUMER_GROUP, msgId);
+                            } catch (Exception ackEx) {
+                                LOGGER.log(Level.WARNING, "[Redisson] Failed to ack stream message " + msgId, ackEx);
+                            }
+                        }
+                    });
                 }
             } catch (Exception e) {
                 if (!running.get()) {
@@ -479,6 +503,17 @@ public class RedissonManager {
                     LOGGER.warning("[Redisson] Stream consumer executor did not terminate in time.");
                 }
             } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        if (messageDispatcher != null) {
+            messageDispatcher.shutdown();
+            try {
+                if (!messageDispatcher.awaitTermination(3, TimeUnit.SECONDS)) {
+                    messageDispatcher.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                messageDispatcher.shutdownNow();
                 Thread.currentThread().interrupt();
             }
         }

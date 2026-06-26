@@ -115,7 +115,7 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                 // in small batches spread across successive ticks to avoid a lag spike
                 // when many players are online (process at most 10 players per tick).
                 List<Player> players = new ArrayList<>(Bukkit.getOnlinePlayers());
-                final int batchSize = 10;
+                final int batchSize = configManager.getPeriodicSaveBatchSize();
                 for (int i = 0; i < players.size(); i += batchSize) {
                     final int start = i;
                     final int end = Math.min(i + batchSize, players.size());
