@@ -77,9 +77,12 @@ public class SyncManager {
     private LatencyTracker saveLatency;
     private LatencyTracker serializeLatency;
 
-    // Data loaded during pre-login, waiting to be applied on join
-    // null value = player exists but has no saved data (new player)
+    // Data loaded during pre-login, waiting to be applied on join.
+    // ConcurrentHashMap does not permit null values, so players with no saved
+    // data are tracked explicitly in pendingEmptyData.
     private final ConcurrentHashMap<UUID, PlayerData> pendingData = new ConcurrentHashMap<>();
+    private final java.util.Set<UUID> pendingEmptyData = ConcurrentHashMap.newKeySet();
+    private final ConcurrentHashMap<UUID, Long> pendingLoadTimes = new ConcurrentHashMap<>();
 
     // Track players whose data has been applied (actively playing)
     private final ConcurrentHashMap<UUID, Boolean> activePlayers = new ConcurrentHashMap<>();
@@ -386,7 +389,8 @@ public class SyncManager {
 
             if (!loaded.hasData()) {
                 // New player or no saved data - still store fencing token for save
-                pendingData.put(uuid, null);
+                pendingEmptyData.add(uuid);
+                pendingLoadTimes.put(uuid, System.currentTimeMillis());
                 playerFencingTokens.put(uuid, fencingToken);
                 if (config.isDebug()) {
                     logger.info("No saved data for " + uuid + " (new player, fencing token: " + fencingToken + ")");
@@ -435,6 +439,7 @@ public class SyncManager {
             }
 
             pendingData.put(uuid, data);
+            pendingLoadTimes.put(uuid, System.currentTimeMillis());
 
             if (config.isDebug()) {
                 logger.info("Loaded data for " + uuid + " (v" + loaded.version() + ", ft=" + fencingToken + ", " + loaded.data().length + " bytes in DB)");
@@ -471,11 +476,14 @@ public class SyncManager {
     public void applyPlayerData(Player player) {
         UUID uuid = player.getUniqueId();
         PlayerData data = pendingData.remove(uuid);
+        boolean hadEmptyData = pendingEmptyData.remove(uuid);
+        pendingLoadTimes.remove(uuid);
 
         if (data == null) {
             // New player or no saved data - nothing to apply
             if (config.isDebug()) {
-                logger.info("No pending data to apply for " + uuid + " (new player)");
+                logger.info("No pending data to apply for " + uuid
+                    + (hadEmptyData ? " (new player)" : " (no preloaded data)"));
             }
             activePlayers.put(uuid, true);
             return;
@@ -640,8 +648,10 @@ public class SyncManager {
         playerFencingTokens.remove(uuid);
 
         // Check if player has pending data (was kicked during pre-login, never joined)
-        if (pendingData.containsKey(uuid)) {
+        if (pendingData.containsKey(uuid) || pendingEmptyData.contains(uuid)) {
             pendingData.remove(uuid);
+            pendingEmptyData.remove(uuid);
+            pendingLoadTimes.remove(uuid);
             // Release lock without saving
             pendingSaveCount.incrementAndGet();
             asyncExecutor.execute(() -> {
@@ -1347,9 +1357,11 @@ public class SyncManager {
         long now = System.currentTimeMillis();
         long staleThreshold = 5 * 60 * 1000; // 5 minutes
 
-        pendingData.forEach((uuid, data) -> {
-            if (data != null && data.getTimestamp() > 0 && (now - data.getTimestamp()) > staleThreshold) {
+        pendingLoadTimes.forEach((uuid, loadTime) -> {
+            if (loadTime != null && (now - loadTime) > staleThreshold) {
                 pendingData.remove(uuid);
+                pendingEmptyData.remove(uuid);
+                pendingLoadTimes.remove(uuid);
                 asyncExecutor.execute(() -> {
                     try {
                         databaseManager.releaseLock(uuid, config.getServerName());
@@ -1476,7 +1488,7 @@ public class SyncManager {
     }
 
     public int getPendingCount() {
-        return pendingData.size();
+        return pendingData.size() + pendingEmptyData.size();
     }
 
     public int getActiveCount() {

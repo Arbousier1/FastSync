@@ -6,6 +6,7 @@ import org.bukkit.persistence.PersistentDataContainer;
 import org.bukkit.persistence.PersistentDataType;
 import java.io.*;
 import java.util.*;
+import java.util.Base64;
 import java.util.logging.Logger;
 import java.util.logging.Level;
 
@@ -60,7 +61,8 @@ public class RegisteredKeysPdcStrategy implements PdcSyncStrategy {
             for (var entry : entries) {
                 String keyStr = entry.getKey().toString();
                 out.writeUTF(keyStr);
-                String valStr = String.valueOf(entry.getValue());
+                PersistentDataType type = registeredKeys.get(entry.getKey());
+                String valStr = serializeValue(entry.getValue(), type);
                 out.writeUTF(valStr);
             }
             out.flush();
@@ -101,7 +103,18 @@ public class RegisteredKeysPdcStrategy implements PdcSyncStrategy {
     }
     
     @SuppressWarnings("unchecked")
+    private String serializeValue(Object value, PersistentDataType type) {
+        if (type == PersistentDataType.BYTE_ARRAY && value instanceof byte[] bytes) {
+            return Base64.getEncoder().encodeToString(bytes);
+        }
+        return String.valueOf(value);
+    }
+
+    @SuppressWarnings("unchecked")
     private Object deserializeValue(String valStr, PersistentDataType type) {
+        if (type == PersistentDataType.BYTE_ARRAY) {
+            return Base64.getDecoder().decode(valStr);
+        }
         String name = type.getComplexType().getSimpleName();
         return switch (name) {
             case "Integer" -> Integer.parseInt(valStr);
