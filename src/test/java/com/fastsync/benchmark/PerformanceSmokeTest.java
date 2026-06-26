@@ -193,6 +193,8 @@ class PerformanceSmokeTest {
                 DatabaseManager.computeChecksum(data);
             }
             long elapsed = System.nanoTime() - start;
+            // Guard against nanoTime precision issues on some CI runners
+            if (elapsed <= 0) elapsed = 1;
             double throughput = (size * iterations) / (elapsed / 1_000_000_000.0) / (1024 * 1024);
 
             System.out.printf("[CRC32] %6d bytes: %.0f MB/s%n", size, throughput);

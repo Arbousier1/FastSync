@@ -112,10 +112,15 @@ tasks.withType<JavaCompile>().configureEach {
 tasks.withType<Test>().configureEach {
     useJUnitPlatform()
     // Chronicle Queue uses internal sun.nio APIs for mmap, requires --add-opens on JDK 16+
-    jvmArgs(
+    // See https://chronicle.software/chronicle-support-java-17
+    allJvmArgs = listOf(
+        "-XX:+EnableDynamicAgentLoading",
         "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",
         "--add-opens=java.base/java.nio=ALL-UNNAMED",
-        "--add-opens=java.base/jdk.internal.misc=ALL-UNNAMED"
+        "--add-opens=java.base/jdk.internal.misc=ALL-UNNAMED",
+        "--add-opens=java.base/sun.security.action=ALL-UNNAMED",
+        "--add-exports=java.base/jdk.internal.misc=ALL-UNNAMED",
+        "--add-exports=java.base/sun.nio.ch=ALL-UNNAMED"
     )
     testLogging {
         events("passed", "skipped", "failed")
