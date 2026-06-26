@@ -44,11 +44,18 @@ class PerformanceSmokeTest {
         try {
             logManager = new ChronicleQueueLogManager(tempDir, 500);
             logManager.initialize();
+            // Probe: do a test append to trigger Chronicle Queue mmap initialization.
+            // If --add-opens is not configured (CI), this will fail and we skip CQ tests.
+            UUID probeId = UUID.randomUUID();
+            OperationLog probeLog = OperationLog.create(probeId, OperationType.SAVE,
+                "probe", 0, 0, 0, "probe");
+            logManager.append(probeLog).join();
         } catch (Throwable e) {
             // Chronicle Queue requires --add-opens for sun.nio.ch on JDK 16+.
             // In CI without proper JVM args, the mmap initialization fails.
             // Skip CQ tests gracefully — production (Paper server) will have
             // these JVM args configured in the startup script.
+            logManager = null;
             org.junit.jupiter.api.Assumptions.assumeTrue(false,
                 "Chronicle Queue skipped (JVM --add-opens not configured): " + e.getMessage());
         }
