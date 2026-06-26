@@ -93,6 +93,14 @@ public class SyncManager {
     // Track the fencing token for each player (Kleppmann stale-write defence)
     private final ConcurrentHashMap<UUID, Long> playerFencingTokens = new ConcurrentHashMap<>();
 
+    // Per-UUID save lock: ensures saves for the same player run sequentially.
+    // Periodic saves use tryLock() and skip if a save is in flight (coalescing —
+    // the next periodic save will pick up the latest data).
+    // Quit saves use lock() and wait, because they MUST persist the final state.
+    // This prevents unnecessary version conflicts when periodic + quit saves
+    // race for the same player.
+    private final ConcurrentHashMap<UUID, java.util.concurrent.locks.ReentrantLock> playerSaveLocks = new ConcurrentHashMap<>();
+
     // Track pending async saves for graceful shutdown
     private final AtomicInteger pendingSaveCount = new AtomicInteger(0);
     private final AtomicInteger pendingLoadCount = new AtomicInteger(0);
@@ -673,9 +681,14 @@ public class SyncManager {
         // Collect data on main thread
         PlayerData data = collectPlayerData(player);
 
-        // Save asynchronously using dedicated thread pool
+        // Save asynchronously using dedicated thread pool.
+        // Per-UUID lock ensures this save runs AFTER any in-flight periodic save,
+        // preventing version conflicts from concurrent saves for the same player.
         pendingSaveCount.incrementAndGet();
+        java.util.concurrent.locks.ReentrantLock saveLock =
+            playerSaveLocks.computeIfAbsent(uuid, k -> new java.util.concurrent.locks.ReentrantLock());
         asyncExecutor.execute(() -> {
+            saveLock.lock(); // must wait — quit save must persist final state
             try {
                 long startTime = System.nanoTime();
 
@@ -757,6 +770,8 @@ public class SyncManager {
                     logger.log(Level.WARNING, "Failed to release lock after save error for " + uuid, ex);
                 }
             } finally {
+                saveLock.unlock();
+                playerSaveLocks.remove(uuid, saveLock);
                 pendingSaveCount.decrementAndGet();
             }
         });
@@ -1315,7 +1330,19 @@ public class SyncManager {
             PlayerData data = collectPlayerData(player);
 
             pendingSaveCount.incrementAndGet();
+            java.util.concurrent.locks.ReentrantLock saveLock =
+                playerSaveLocks.computeIfAbsent(uuid, k -> new java.util.concurrent.locks.ReentrantLock());
             asyncExecutor.execute(() -> {
+                // Periodic save: skip if a save is already in progress for this player.
+                // The next periodic tick will pick up the latest data — coalescing
+                // avoids unnecessary version conflicts and saves CPU/DB load.
+                if (!saveLock.tryLock()) {
+                    pendingSaveCount.decrementAndGet();
+                    if (config.isDebug()) {
+                        logger.fine("Skipping periodic save for " + uuid + " — save already in progress");
+                    }
+                    return;
+                }
                 try {
                     byte[] serialized = PlayerDataSerializer.serialize(data);
                     byte[] compressed = CompressionUtil.wrap(serialized, config.getCompressionMinSize());
@@ -1335,6 +1362,8 @@ public class SyncManager {
             } catch (Exception e) {
                 logger.log(Level.WARNING, "Periodic save failed for " + uuid, e);
             } finally {
+                saveLock.unlock();
+                playerSaveLocks.remove(uuid, saveLock);
                 pendingSaveCount.decrementAndGet();
             }
         });
