@@ -1,5 +1,4 @@
 import org.gradle.api.file.DuplicatesStrategy
-import com.gradleup.shadow.tasks.ShadowJar
 
 plugins {
     java
@@ -180,27 +179,25 @@ val velocityJar = tasks.register<Jar>("velocityJar") {
 }
 
 // =============================================================================
-// Main JAR: Paper/Folia backend plugin
+// Main JAR: Paper/Folia backend plugin (shadowJar)
 // =============================================================================
 // Sparrow libraries are shaded into this JAR (no relocation). Maven Central
 // dependencies are declared in plugin.yml `libraries:` and auto-downloaded by
 // Paper at startup. The manifest declares `paperweight-mappings-namespace:
 // mojang` so Paper skips its PluginRemapper.
-tasks.named<ShadowJar>("shadowJar") {
+tasks.shadowJar {
     group = "build"
     description = "Packages the Paper/Folia backend plugin JAR with Sparrow libraries shaded in."
     archiveBaseName.set("FastSync")
     archiveVersion.set(version.toString())
     archiveClassifier.set("")
 
-    // Only shade Sparrow libraries; exclude everything else that might leak
-    // into runtimeClasspath (e.g. transitive deps of Sparrow that are also on
-    // Maven Central and declared in plugin.yml libraries).
-    dependencies {
-        include(dependency("net.momirealms:sparrow-nbt:"))
-        include(dependency("net.momirealms:sparrow-yaml:"))
-        include(dependency("net.momirealms:sparrow-redis-message-broker:"))
-    }
+    // Only shade Sparrow libraries; exclude everything else.
+    // In Shadow 9.x, use include() with dependency specifiers.
+    include(project.sourceSets.main.get().output)
+    include(dependency("net.momirealms:sparrow-nbt:"))
+    include(dependency("net.momirealms:sparrow-yaml:"))
+    include(dependency("net.momirealms:sparrow-redis-message-broker:"))
 
     // Strip META-INF signatures and duplicate metadata
     exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA",
