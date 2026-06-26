@@ -11,7 +11,7 @@ libraries:
   - com.zaxxer:HikariCP:5.1.0
   - org.lz4:lz4-java:1.8.0
   - com.mysql:mysql-connector-j:9.0.0
-  - io.lettuce:lettuce-core:6.4.0.RELEASE
+  - io.lettuce:lettuce-core:7.6.0.RELEASE
   - com.github.ben-manes.caffeine:caffeine:3.2.3
   - org.reactivestreams:reactive-streams:1.0.4
 

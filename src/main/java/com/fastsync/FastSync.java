@@ -80,13 +80,15 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         syncManager.initialize();
 
         // Register plugin messaging channel for proxy handoff communication
+        // This is optional — if no Velocity proxy with FastSync Proxy is installed,
+        // the channel simply never receives messages. The backend works standalone.
         Bukkit.getMessenger().registerIncomingPluginChannel(
             this, com.fastsync.messaging.HandoffMessageListener.CHANNEL,
             new com.fastsync.messaging.HandoffMessageListener(
                 this, configManager, databaseManager, syncManager));
         Bukkit.getMessenger().registerOutgoingPluginChannel(
             this, com.fastsync.messaging.HandoffMessageListener.CHANNEL);
-        getLogger().info("Registered fastsync:handoff plugin messaging channel");
+        getLogger().info("Registered fastsync:handoff plugin messaging channel (optional: for Velocity proxy integration)");
 
         // Register listeners
         getServer().getPluginManager().registerEvents(

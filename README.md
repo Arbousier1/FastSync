@@ -38,7 +38,14 @@ Sparrow 系列库（不在 Maven Central）已经 shade 进了 jar 里；HikariC
 
 ### 3. 安装 Velocity 代理插件（可选）
 
-把 `build/libs/FastSync-Proxy-1.0.0.jar` 放到 Velocity 的 `plugins/` 目录。它目前用于追踪玩家当前所在子服和切换时间，未来会扩展为强制路由等待/重定向功能。
+**Velocity 代理插件不是必须的。** 后端 Paper/Folia 插件可以独立运行，不安装代理插件也不影响数据同步功能。
+
+如果使用了 Velocity 代理，可以把 `build/libs/FastSync-Proxy-1.0.0.jar` 放到 Velocity 的 `plugins/` 目录，获得以下额外功能：
+
+- **`/fastsync status`**：在代理端聚合查看所有后端的 DB/Redis 健康状态、在线玩家数、待保存/待加载数
+- **`/fastsync players`**：查看所有玩家当前所在子服
+- **玩家切换通知**：玩家切服时通知新后端"该玩家从 X 服过来"（后端可据此做日志记录）
+- **`proxy-config.yml`**：可配置切换等待超时、状态查询超时等参数
 
 ## 配置
 
