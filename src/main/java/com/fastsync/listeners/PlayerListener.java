@@ -2,6 +2,7 @@ package com.fastsync.listeners;
 
 import com.fastsync.FastSync;
 import com.fastsync.sync.SyncManager;
+import com.fastsync.util.SchedulerUtil;
 import org.bukkit.ChatColor;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
@@ -65,18 +66,32 @@ public class PlayerListener implements Listener {
     /**
      * Apply loaded player data when the player joins.
      * Must be LOWEST priority so data is applied before other plugins interact.
+     *
+     * <p>On Folia, PlayerJoinEvent fires on the region thread that owns the
+     * player entity, but we dispatch via entity scheduler to be explicit
+     * and safe across all server implementations.
      */
     @EventHandler(priority = EventPriority.LOWEST)
     public void onJoin(PlayerJoinEvent event) {
-        syncManager.applyPlayerData(event.getPlayer());
+        var player = event.getPlayer();
+        SchedulerUtil.runAtEntity(plugin, player, () ->
+            syncManager.applyPlayerData(player)
+        , null);
     }
 
     /**
      * Collect and save player data when the player quits.
      * Uses HIGHEST priority so other plugins can process quit first.
+     *
+     * <p>On Folia, Bukkit API (inventory, health, stats) must be read on the
+     * player's entity region thread. PlayerQuitEvent may not guarantee this,
+     * so we dispatch via entity scheduler.
      */
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onQuit(PlayerQuitEvent event) {
-        syncManager.collectAndSavePlayerData(event.getPlayer());
+        var player = event.getPlayer();
+        SchedulerUtil.runAtEntity(plugin, player, () ->
+            syncManager.collectAndSavePlayerData(player)
+        , null);
     }
 }

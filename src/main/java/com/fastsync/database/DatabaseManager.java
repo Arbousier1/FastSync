@@ -416,10 +416,12 @@ public class DatabaseManager {
     public boolean saveData(UUID uuid, byte[] data, long checksum, long expectedVersion,
                             long fencingToken, String serverName) throws SQLException {
         long now = System.currentTimeMillis();
-        // Both version AND fencing token must pass for the write to succeed.
+        // Triple CAS: version + fencing_token + locked_by
         // - version = expectedVersion: optimistic concurrency (row not modified since load)
-        // - fencing_token <= fencingToken: the writer's lock is not stale
-        //   (a newer lock holder would have a higher stored fencing_token, rejecting us)
+        // - fencing_token = fencingToken: the writer's lock is exactly this one
+        //   (a newer lock holder would have a different stored fencing_token, rejecting us)
+        // - locked_by = serverName: the writer currently holds the DB lock
+        //   (prevents writes after lock release due to logic bugs or races)
         try (Connection conn = dataSource.getConnection()) {
             return dsl(conn).update(playerData)
                 .set(DATA_FIELD, data)
@@ -431,7 +433,8 @@ public class DatabaseManager {
                 .set(LAST_UPDATED_FIELD, now)
                 .where(UUID_FIELD.eq(uuid.toString())
                     .and(VERSION_FIELD.eq(expectedVersion))
-                    .and(FENCING_TOKEN_FIELD.le(fencingToken)))
+                    .and(FENCING_TOKEN_FIELD.eq(fencingToken))
+                    .and(LOCKED_BY_FIELD.eq(serverName)))
                 .execute() > 0;
         }
     }

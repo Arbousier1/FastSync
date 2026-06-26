@@ -396,12 +396,14 @@ public class SyncManager {
             }
 
             if (!loaded.hasData()) {
-                // New player or no saved data - still store fencing token for save
+                // New player or no saved data - still store fencing token and version for save
                 pendingEmptyData.add(uuid);
                 pendingLoadTimes.put(uuid, System.currentTimeMillis());
                 playerFencingTokens.put(uuid, fencingToken);
+                // Explicitly set version=0 for new players (DB default, but don't rely on implicit behavior)
+                playerVersions.put(uuid, loaded.version());
                 if (config.isDebug()) {
-                    logger.info("No saved data for " + uuid + " (new player, fencing token: " + fencingToken + ")");
+                    logger.info("No saved data for " + uuid + " (new player, v" + loaded.version() + ", ft: " + fencingToken + ")");
                 }
                 return LoadResult.success();
             }
@@ -697,19 +699,37 @@ public class SyncManager {
         pendingSaveCount.incrementAndGet();
         java.util.concurrent.locks.ReentrantLock saveLock =
             playerSaveLocks.computeIfAbsent(uuid, k -> new java.util.concurrent.locks.ReentrantLock());
-        asyncExecutor.execute(() -> {
-            saveLock.lock(); // must wait — quit save must persist final state
+        try {
+            asyncExecutor.execute(() -> {
+                saveLock.lock(); // must wait — quit save must persist final state
+                try {
+                    persistCollectedData(uuid, data, SaveKind.QUIT);
+                } finally {
+                    saveLock.unlock();
+                    playerSaveLocks.remove(uuid, saveLock);
+                    // Clean up version/token tracking now that save is complete
+                    playerVersions.remove(uuid);
+                    playerFencingTokens.remove(uuid);
+                    pendingSaveCount.decrementAndGet();
+                }
+            });
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            // Queue full — quit save MUST NOT be lost.
+            // Fallback: run synchronously on the current thread (PlayerQuitEvent
+            // is on main/region thread, but this is better than losing data).
+            logger.log(Level.SEVERE, "Async executor rejected quit save for " + uuid
+                + " — running synchronously as fallback", e);
+            saveLock.lock();
             try {
                 persistCollectedData(uuid, data, SaveKind.QUIT);
             } finally {
                 saveLock.unlock();
                 playerSaveLocks.remove(uuid, saveLock);
-                // Clean up version/token tracking now that save is complete
                 playerVersions.remove(uuid);
                 playerFencingTokens.remove(uuid);
                 pendingSaveCount.decrementAndGet();
             }
-        });
+        }
     }
 
     /**
@@ -1216,7 +1236,6 @@ public class SyncManager {
         int total = 0;
         int success = 0;
         int failed = 0;
-        List<UUID> failedPlayers = new ArrayList<>();
         List<CompletableFuture<SaveResult>> futures = new ArrayList<>();
         Plugin plugin = JavaPlugin.getPlugin(FastSync.class);
 
@@ -1232,10 +1251,19 @@ public class SyncManager {
                 try {
                     PlayerData data = collectPlayerData(player);
                     pendingSaveCount.incrementAndGet();
+                    // Use per-UUID lock to serialize with any in-flight periodic/quit save
+                    java.util.concurrent.locks.ReentrantLock saveLock =
+                        playerSaveLocks.computeIfAbsent(uuid, k -> new java.util.concurrent.locks.ReentrantLock());
                     asyncExecutor.execute(() -> {
                         SaveResult result;
                         try {
-                            result = persistCollectedData(uuid, data, SaveKind.BULK);
+                            saveLock.lock();
+                            try {
+                                result = persistCollectedData(uuid, data, SaveKind.BULK);
+                            } finally {
+                                saveLock.unlock();
+                                playerSaveLocks.remove(uuid, saveLock);
+                            }
                         } catch (Exception e) {
                             result = SaveResult.error(e.getMessage());
                         } finally {
@@ -1253,15 +1281,19 @@ public class SyncManager {
             futures.add(future);
         }
 
-        // Wait for all DB saves to complete. Don't throw on individual failures.
+        // Wait for all DB saves with per-future timeout (5s each).
+        // Prevents Folia onDisable hang when entity scheduler is unreliable.
         for (CompletableFuture<SaveResult> f : futures) {
             try {
-                SaveResult result = f.join();
+                SaveResult result = f.get(5, java.util.concurrent.TimeUnit.SECONDS);
                 if (result.success()) {
                     success++;
                 } else {
                     failed++;
                 }
+            } catch (java.util.concurrent.TimeoutException e) {
+                logger.warning("saveAllOnlinePlayers: timeout waiting for player save (5s)");
+                failed++;
             } catch (Exception e) {
                 failed++;
             }

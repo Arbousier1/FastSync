@@ -70,7 +70,7 @@ public class PlayerDataSerializer {
         root.putInt("totalExperience", data.getTotalExperience());
 
         // Extra
-        root.putByte("gameMode", (byte) (data.getGameMode() != null ? data.getGameMode().ordinal() : 0));
+        root.putString("gameMode", data.getGameMode() != null ? data.getGameMode().name() : "SURVIVAL");
         root.putInt("fireTicks", data.getFireTicks());
         root.putInt("remainingAir", data.getRemainingAir());
         root.putInt("maximumAir", data.getMaximumAir());
@@ -232,7 +232,17 @@ public class PlayerDataSerializer {
         // Extra
         int gmOrdinal = root.getByte("gameMode") & 0xFF;
         GameMode[] gameModes = GameMode.values();
-        playerData.setGameMode(gmOrdinal < gameModes.length ? gameModes[gmOrdinal] : GameMode.SURVIVAL);
+        // Try name-based deserialization first (current format)
+        try {
+            playerData.setGameMode(GameMode.valueOf(root.getString("gameMode")));
+        } catch (Exception nameEx) {
+            // Fallback: legacy ordinal-based format (for data saved by older versions)
+            try {
+                playerData.setGameMode(gmOrdinal < gameModes.length ? gameModes[gmOrdinal] : GameMode.SURVIVAL);
+            } catch (Exception ordEx) {
+                playerData.setGameMode(GameMode.SURVIVAL);
+            }
+        }
         playerData.setFireTicks(root.getInt("fireTicks"));
         playerData.setRemainingAir(root.getInt("remainingAir"));
         playerData.setMaximumAir(root.getInt("maximumAir"));

@@ -57,6 +57,9 @@ public class RegisteredKeysPdcStrategy implements PdcSyncStrategy {
     private static final byte TYPE_STRING = 8;
     private static final byte TYPE_BYTE_ARRAY = 9;
 
+    /** Max allowed BYTE_ARRAY length in PDC values — guards against corrupted data. */
+    private static final int MAX_PDC_VALUE_BYTES = 1024 * 1024; // 1MB
+
     @SuppressWarnings({"rawtypes", "unchecked"})
     public RegisteredKeysPdcStrategy(List<KeyBinding> keys, Logger logger, boolean debug) {
         this.logger = logger;
@@ -180,6 +183,9 @@ public class RegisteredKeysPdcStrategy implements PdcSyncStrategy {
             case TYPE_STRING -> in.readUTF();
             case TYPE_BYTE_ARRAY -> {
                 int len = in.readInt();
+                if (len < 0 || len > MAX_PDC_VALUE_BYTES) {
+                    throw new IOException("BYTE_ARRAY length " + len + " out of bounds (max " + MAX_PDC_VALUE_BYTES + ")");
+                }
                 byte[] bytes = new byte[len];
                 in.readFully(bytes);
                 yield bytes;
