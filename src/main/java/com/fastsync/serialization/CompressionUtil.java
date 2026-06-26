@@ -51,21 +51,23 @@ public class CompressionUtil {
 
         if (shouldCompress) {
             int maxCompressedLen = compressor.maxCompressedLength(data.length);
-            byte[] compressed = new byte[maxCompressedLen];
-            int compressedLen = compressor.compress(data, 0, data.length, compressed, 0, maxCompressedLen);
+            // Allocate the final result array directly: header + worst-case compressed length,
+            // then compress straight into result[6..] and trim to the exact compressed length.
+            // This avoids allocating a separate maxCompressedLen temp buffer + a System.arraycopy.
+            byte[] result = new byte[6 + maxCompressedLen];
+            result[0] = FORMAT_VERSION;
+            result[1] = FLAG_COMPRESSED;
+            result[2] = (byte) (data.length >>> 24);
+            result[3] = (byte) (data.length >>> 16);
+            result[4] = (byte) (data.length >>> 8);
+            result[5] = (byte) (data.length);
+            int compressedLen = compressor.compress(data, 0, data.length, result, 6, maxCompressedLen);
 
             // Only use compression if it actually reduces size
             // Account for 4 extra bytes (original length header)
             if (compressedLen + 6 < data.length + 2) {
-                byte[] result = new byte[6 + compressedLen];
-                result[0] = FORMAT_VERSION;
-                result[1] = FLAG_COMPRESSED;
-                result[2] = (byte) (data.length >>> 24);
-                result[3] = (byte) (data.length >>> 16);
-                result[4] = (byte) (data.length >>> 8);
-                result[5] = (byte) (data.length);
-                System.arraycopy(compressed, 0, result, 6, compressedLen);
-                return result;
+                // Trim the oversized buffer down to the exact compressed length.
+                return Arrays.copyOf(result, 6 + compressedLen);
             }
         }
 
@@ -108,9 +110,9 @@ public class CompressionUtil {
                                | ((wrappedData[4] & 0xFF) << 8)
                                | (wrappedData[5] & 0xFF);
 
-            byte[] compressedData = Arrays.copyOfRange(wrappedData, 6, wrappedData.length);
+            int compressedLen = wrappedData.length - 6;
             byte[] restored = new byte[originalLength];
-            decompressor.decompress(compressedData, 0, restored, 0, originalLength);
+            decompressor.decompress(wrappedData, 6, restored, 0, originalLength);
             return restored;
         } else {
             return Arrays.copyOfRange(wrappedData, 2, wrappedData.length);

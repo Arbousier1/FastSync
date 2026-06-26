@@ -29,17 +29,15 @@ import org.bukkit.attribute.Attribute;
 import org.bukkit.attribute.AttributeInstance;
 import org.bukkit.attribute.AttributeModifier;
 import org.bukkit.entity.Player;
-import org.bukkit.persistence.PersistentDataContainer;
-import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.potion.PotionEffect;
 import org.bukkit.Statistic;
 
-import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
@@ -798,31 +796,19 @@ public class SyncManager {
         }
     }
 
-    @SuppressWarnings("unchecked")
     private void collectPDC(Player player, PlayerData data) {
-        try {
-            Map<String, byte[]> pdcData = new HashMap<>();
-            PersistentDataContainer pdc = player.getPersistentDataContainer();
-            // PDC keys are not enumerable in Bukkit API - we serialize the whole container
-            // Using Bukkit's serialization to byte array
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            try {
-                org.bukkit.util.io.BukkitObjectOutputStream oos = new org.bukkit.util.io.BukkitObjectOutputStream(baos);
-                // Write the player's PDC as a serialized map
-                Map<String, Object> pdcMap = new HashMap<>();
-                // We can't enumerate PDC keys, so we store a marker
-                // In production, plugins would register their keys for sync
-                pdcMap.put("__pdc_serialized__", true);
-                oos.writeObject(pdcMap);
-                oos.close();
-                pdcData.put("__pdc__", baos.toByteArray());
-            } catch (Exception ignored) {}
-            data.setPersistentDataContainer(pdcData);
-        } catch (Exception e) {
-            if (config.isDebug()) {
-                logger.warning("Failed to collect PDC: " + e.getMessage());
-            }
-        }
+        // TODO: Bukkit's PersistentDataContainer API does not expose a way to enumerate
+        // the keys stored on a holder, so there is no reliable way to serialize the
+        // player's full PDC here. The previous implementation only stuffed a dummy
+        // marker entry ("__pdc__" -> serialized {"__pdc_serialized__": true}) which
+        // carried no real data, so it has been removed.
+        //
+        // Real PDC synchronization would require a custom PDC registry where plugins
+        // register the NamespacedKeys they want synchronized; only those known keys
+        // could then be read via PersistentDataContainer#get(NamespacedKey, ...) and
+        // serialized. Until such a registry exists, we intentionally store an empty
+        // map instead of a misleading placeholder.
+        data.setPersistentDataContainer(new HashMap<>());
     }
 
     // ==================== Data Apply Helpers ====================
@@ -914,14 +900,27 @@ public class SyncManager {
 
     /**
      * Save all online players' data (for periodic saves and shutdown).
+     *
+     * <p>Data collection happens on the calling thread because Bukkit's player API
+     * is not thread-safe (during shutdown this is the main thread). The expensive
+     * serialization and database write for each player is dispatched to the async
+     * executor and run in parallel, and we block on
+     * {@code CompletableFuture.allOf(...).join()} so that shutdown does not return
+     * until every save has completed. This avoids saving every player synchronously
+     * on the main thread, which would hang the server during shutdown.
      */
     public void saveAllOnlinePlayers() {
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
         for (Player player : Bukkit.getOnlinePlayers()) {
-            if (activePlayers.containsKey(player.getUniqueId())) {
-                UUID uuid = player.getUniqueId();
-                PlayerData data = collectPlayerData(player);
+            if (!activePlayers.containsKey(player.getUniqueId())) {
+                continue;
+            }
+            UUID uuid = player.getUniqueId();
+            // Collect on the calling (main) thread - Bukkit API is not thread-safe.
+            PlayerData data = collectPlayerData(player);
 
-                // Save synchronously during shutdown
+            // Serialize + DB write happen async, but we wait for all of them below.
+            futures.add(asyncExecutor.submit(() -> {
                 try {
                     byte[] serialized = PlayerDataSerializer.serialize(data);
                     byte[] compressed = CompressionUtil.wrap(serialized, config.getCompressionMinSize());
@@ -937,8 +936,13 @@ public class SyncManager {
                 } catch (Exception e) {
                     logger.log(Level.SEVERE, "Failed to save data for " + uuid + " during bulk save", e);
                 }
-            }
+            }));
         }
+
+        // Wait for all async saves to complete before returning. This is critical
+        // for shutdown: the caller (onDisable) must not proceed to tear down the
+        // thread pool / database until every save has finished.
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
         logger.info("Saved data for all online players.");
     }
 

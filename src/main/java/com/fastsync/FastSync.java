@@ -111,8 +111,20 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         if (configManager.isPeriodicSave()) {
             long intervalTicks = configManager.getPeriodicSaveIntervalSeconds() * 20L;
             periodicSaveTask = SchedulerUtil.runGlobalTimer(this, () -> {
-                for (Player player : Bukkit.getOnlinePlayers()) {
-                    syncManager.savePlayerAsync(player);
+                // Snapshot online players on the global region thread, then save them
+                // in small batches spread across successive ticks to avoid a lag spike
+                // when many players are online (process at most 10 players per tick).
+                List<Player> players = new ArrayList<>(Bukkit.getOnlinePlayers());
+                final int batchSize = 10;
+                for (int i = 0; i < players.size(); i += batchSize) {
+                    final int start = i;
+                    final int end = Math.min(i + batchSize, players.size());
+                    long delayTicks = i / batchSize;
+                    SchedulerUtil.runAsyncDelayed(this, () -> {
+                        for (int j = start; j < end; j++) {
+                            syncManager.savePlayerAsync(players.get(j));
+                        }
+                    }, delayTicks);
                 }
             }, intervalTicks, intervalTicks);
             getLogger().info("Periodic save enabled: every " +
@@ -197,7 +209,17 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                     sender.sendMessage(ChatColor.RED + "Usage: /" + label + " log <player|uuid> [limit]");
                     return true;
                 }
-                int limit = args.length >= 3 ? Math.min(Integer.parseInt(args[2]), 50) : 20;
+                int limit;
+                if (args.length >= 3) {
+                    try {
+                        limit = Math.min(Integer.parseInt(args[2]), 50);
+                    } catch (NumberFormatException e) {
+                        sender.sendMessage(ChatColor.RED + "Invalid number: " + args[2]);
+                        return true;
+                    }
+                } else {
+                    limit = 20;
+                }
                 UUID targetUuid;
                 Player target = Bukkit.getPlayer(args[1]);
                 if (target != null) {

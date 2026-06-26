@@ -13,10 +13,6 @@ import org.testcontainers.utility.DockerImageName;
 
 import java.sql.SQLException;
 import java.util.UUID;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -29,7 +25,6 @@ import static org.junit.jupiter.api.Assertions.*;
  * <ul>
  *   <li>Fencing token stale-write rejection (Kleppmann)</li>
  *   <li>Optimistic concurrency version check (Dynamo)</li>
- *   <li>Atomic operation sequence counter (Raft-inspired op log)</li>
  *   <li>Per-UUID lock acquisition/release</li>
  * </ul>
  *
@@ -186,39 +181,6 @@ class DatabaseManagerTest {
         long checksumA2 = DatabaseManager.computeChecksum(dataA2);
         boolean saved = databaseManager.saveData(uuid, dataA2, checksumA2, afterB.version(), lockA.fencingToken(), "server-a");
         assertFalse(saved, "Lower fencing token write should be rejected (Kleppmann)");
-    }
-
-    @Test
-    void testIncrementOpSeqIsAtomicAndMonotonic() throws Exception {
-        UUID uuid = UUID.randomUUID();
-        int threads = 10;
-        int iterations = 100;
-        ExecutorService executor = Executors.newFixedThreadPool(threads);
-        CountDownLatch latch = new CountDownLatch(threads * iterations);
-        AtomicInteger errors = new AtomicInteger(0);
-
-        for (int t = 0; t < threads; t++) {
-            executor.submit(() -> {
-                for (int i = 0; i < iterations; i++) {
-                    try {
-                        databaseManager.incrementOpSeq(uuid);
-                    } catch (SQLException e) {
-                        errors.incrementAndGet();
-                    } finally {
-                        latch.countDown();
-                    }
-                }
-            });
-        }
-
-        latch.await();
-        executor.shutdown();
-        assertEquals(0, errors.get(), "No errors during concurrent op_seq increments");
-
-        // Verify exactly threads * iterations increments occurred
-        long currentSeq = databaseManager.incrementOpSeq(uuid);
-        assertEquals(threads * iterations + 1, currentSeq,
-                "op_seq should be monotonic and atomic under concurrent access");
     }
 
     @Test

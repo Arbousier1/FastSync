@@ -6,6 +6,22 @@
 
 ## [未发布]
 
+### 性能优化
+
+- **LatencyTracker 改用环形缓冲区**：`ConcurrentLinkedDeque<Long>` → 预分配 `long[]` + `AtomicInteger` head 指针，消除装箱分配；`logStats()` 从 3 次 `toArray()+sort()` 改为单次排序
+- **CompressionUtil 减少数组分配**：`wrap()` 直接压缩进最终数组再裁剪（省 1 次分配 + 1 次 `arraycopy`）；`unwrap()` 去掉 `Arrays.copyOfRange`，直接带偏移量传给 LZ4 解压器
+- **关服保存改为异步并行**：`saveAllOnlinePlayers()` 数据采集在主线程，序列化+DB写入派发到异步线程池，`CompletableFuture.allOf().join()` 等待全部完成
+- **周期保存分批**：每 tick 最多处理 10 人，剩余玩家摊到后续 tick，避免大量在线玩家时卡顿
+
+### 修复
+
+- **`collectPDC()` 空操作**：移除只塞了 dummy `__pdc__` 标记的无意义代码，改为返回空 map + TODO 注释（Bukkit PDC API 不支持枚举所有 key）
+- **冲突快照无限累积**：`ConflictManager.saveConflictSnapshot` 保存后未修剪，现已链式调用 `pruneSnapshots(uuid, maxSnapshots)` 与成功路径保持一致
+- **RedissonManager 流消费者异常隔离**：单个 listener 回调抛异常会静默杀掉消费线程；改为 try-catch 隔离 + `ExecutorService` 替代裸 `Thread`
+- **AsyncExecutor 日志**：`e.printStackTrace()` → `logger.log(Level.SEVERE, ..., e)`，统一走日志框架
+- **FastSync 命令异常处理**：`/fastsync log` 的 limit 参数 `parseInt` 未捕获 `NumberFormatException`
+- **DatabaseManager 死代码清理**：移除 `op_seq` 列、`incrementOpSeq()` 方法、`OP_SEQ_FIELD` 常量（操作日志已由 `FileOperationLogManager` 接管，SQL `op_seq` 不再使用）
+
 ### 变更
 
 - **将 `PlayerSpawnLocationEvent` 替换为 `PlayerJoinEvent`**：玩家数据应用从出生位置事件改为加入事件，确保在 `EventPriority.LOWEST` 优先级下先于其他插件应用数据，避免物品复制漏洞

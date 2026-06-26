@@ -5,6 +5,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
@@ -59,8 +60,7 @@ public class AsyncExecutor {
             try {
                 task.run();
             } catch (Exception e) {
-                logger.severe("[" + poolName + "] Uncaught exception in async task: " + e.getMessage());
-                e.printStackTrace();
+                logger.log(Level.SEVERE, "[" + poolName + "] Uncaught exception in async task", e);
             }
         });
     }

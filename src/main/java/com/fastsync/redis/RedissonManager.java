@@ -23,6 +23,8 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
@@ -103,7 +105,7 @@ public class RedissonManager {
     private RedissonClient client;
     private RTopic lockTopic;
     private RStream<String, String> stream;
-    private Thread consumerThread;
+    private ExecutorService consumerExecutor;
     private final AtomicBoolean running = new AtomicBoolean(false);
 
     /**
@@ -165,9 +167,12 @@ public class RedissonManager {
         recoverPendingEntries();
 
         running.set(true);
-        consumerThread = new Thread(this::consumeLoop, "FastSync-Stream-Consumer");
-        consumerThread.setDaemon(true);
-        consumerThread.start();
+        consumerExecutor = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "FastSync-Stream-Consumer");
+            t.setDaemon(true);
+            return t;
+        });
+        consumerExecutor.submit(this::consumeLoop);
 
         // Announce this server is up and ready to accept players.
         publish(StreamEvent.create(StreamEventType.SERVER_START, null, serverName,
@@ -403,7 +408,7 @@ public class RedissonManager {
                 try {
                     listener.onEvent(event);
                 } catch (Exception e) {
-                    LOGGER.log(Level.WARNING, "[Redisson] Listener error for " + event.type(), e);
+                    LOGGER.log(Level.WARNING, "[Redisson] Stream listener exception for event " + event.id(), e);
                 }
             }
         } catch (Exception e) {
@@ -467,10 +472,12 @@ public class RedissonManager {
      */
     public void close() {
         running.set(false);
-        if (consumerThread != null) {
-            consumerThread.interrupt();
+        if (consumerExecutor != null) {
+            consumerExecutor.shutdownNow();
             try {
-                consumerThread.join(3000);
+                if (!consumerExecutor.awaitTermination(3, TimeUnit.SECONDS)) {
+                    LOGGER.warning("[Redisson] Stream consumer executor did not terminate in time.");
+                }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }

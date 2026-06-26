@@ -95,8 +95,18 @@ public class ConflictManager {
             String cause = String.format("CONFLICT_expected_v%d_actual_v%d", expectedVersion, actualVersion);
 
             snapshotManager.createSnapshot(uuid, compressed, cause)
-                .thenRun(() -> logger.info("[Conflict] Stale data saved as conflict snapshot for " + uuid +
-                    " (cause: " + cause + ")"))
+                .thenRun(() -> {
+                    logger.info("[Conflict] Stale data saved as conflict snapshot for " + uuid +
+                        " (cause: " + cause + ")");
+                    // Prune old snapshots so conflict snapshots cannot accumulate
+                    // without bound. This mirrors the prune call used on the success
+                    // path in SyncManager. Pinned snapshots are preserved by pruneSnapshots.
+                    snapshotManager.pruneSnapshots(uuid, config.getMaxSnapshots())
+                        .exceptionally(pruneEx -> {
+                            logger.log(Level.WARNING, "[Conflict] Failed to prune snapshots for " + uuid, pruneEx);
+                            return null;
+                        });
+                })
                 .exceptionally(e -> {
                     logger.log(Level.WARNING, "[Conflict] Failed to save conflict snapshot for " + uuid, e);
                     return null;

@@ -48,7 +48,6 @@ public class DatabaseManager {
     private static final Field<Long> VERSION_FIELD = field(name("version"), Long.class);
     private static final Field<Long> CHECKSUM_FIELD = field(name("checksum"), Long.class);
     private static final Field<Long> FENCING_TOKEN_FIELD = field(name("fencing_token"), Long.class);
-    private static final Field<Long> OP_SEQ_FIELD = field(name("op_seq"), Long.class);
     private static final Field<String> LOCKED_BY_FIELD = field(name("locked_by"), String.class);
     private static final Field<Long> LOCKED_AT_FIELD = field(name("locked_at"), Long.class);
     private static final Field<String> LAST_SERVER_FIELD = field(name("last_server"), String.class);
@@ -138,7 +137,6 @@ public class DatabaseManager {
                 `version` BIGINT NOT NULL DEFAULT 0,
                 `checksum` BIGINT NOT NULL DEFAULT 0,
                 `fencing_token` BIGINT NOT NULL DEFAULT 0,
-                `op_seq` BIGINT NOT NULL DEFAULT 0,
                 `locked_by` VARCHAR(64) DEFAULT NULL,
                 `locked_at` BIGINT DEFAULT NULL,
                 `last_server` VARCHAR(64) DEFAULT NULL,
@@ -168,8 +166,7 @@ public class DatabaseManager {
         String[] migrations = {
             String.format("ALTER TABLE `%s` ADD COLUMN IF NOT EXISTS `version` BIGINT NOT NULL DEFAULT 0", dataTable),
             String.format("ALTER TABLE `%s` ADD COLUMN IF NOT EXISTS `checksum` BIGINT NOT NULL DEFAULT 0", dataTable),
-            String.format("ALTER TABLE `%s` ADD COLUMN IF NOT EXISTS `fencing_token` BIGINT NOT NULL DEFAULT 0", dataTable),
-            String.format("ALTER TABLE `%s` ADD COLUMN IF NOT EXISTS `op_seq` BIGINT NOT NULL DEFAULT 0", dataTable)
+            String.format("ALTER TABLE `%s` ADD COLUMN IF NOT EXISTS `fencing_token` BIGINT NOT NULL DEFAULT 0", dataTable)
         };
         try (Connection conn = dataSource.getConnection()) {
             DSLContext dsl = dsl(conn);
@@ -278,7 +275,6 @@ public class DatabaseManager {
                 .set(VERSION_FIELD, 0L)
                 .set(CHECKSUM_FIELD, 0L)
                 .set(FENCING_TOKEN_FIELD, 0L)
-                .set(OP_SEQ_FIELD, 0L)
                 .set(LOCKED_BY_FIELD, (String) null)
                 .set(LOCKED_AT_FIELD, (Long) null)
                 .set(LAST_SERVER_FIELD, (String) null)
@@ -379,51 +375,6 @@ public class DatabaseManager {
                 .where(UUID_FIELD.eq(uuid.toString()))
                 .fetchOne(FENCING_TOKEN_FIELD);
             return token != null ? token : -1;
-        }
-    }
-
-    /**
-     * Atomically increment and return the per-UUID operation sequence number.
-     *
-     * <p><b>InnoDB locking note:</b> This uses MySQL's {@code LAST_INSERT_ID(expr)} trick
-     * to atomically increment a counter and read back the new value in a single
-     * connection. The {@code UPDATE} is a single-row primary-key update (X lock on
-     * one row only — no gap locks, no next-key locks), and {@code SELECT LAST_INSERT_ID()}
-     * reads the connection-local value. This replaces the unsafe
-     * {@code SELECT MAX(seq) ... FOR UPDATE} pattern which caused gap locks on the
-     * operation_log index, blocking concurrent inserts for adjacent UUIDs.
-     *
-     * <p>jOOQ has no DSL equivalent for {@code LAST_INSERT_ID(expr)}, so the UPDATE is
-     * issued as raw SQL via {@link DSLContext#execute(String, Object...)} and the
-     * connection-local value is read back with {@link DSLContext#fetchValue(String)}.
-     * Both run on the same borrowed connection so the session-local
-     * {@code LAST_INSERT_ID()} is the one we just set.
-     *
-     * <p>InnoDB locking rules followed:
-     * <ol>
-     *   <li>UUID primary key direct access — single-row X lock, no index scan
-     *   <li>No range query + FOR UPDATE on hot path
-     *   <li>Precise CAS on uuid — {@code WHERE uuid = ?} hits the PK index
-     * </ol>
-     *
-     * @return the new sequence number (monotonically increasing per UUID)
-     */
-    public long incrementOpSeq(UUID uuid) throws SQLException {
-        // Ensure the player row exists before incrementing; otherwise the UPDATE
-        // would affect zero rows and LAST_INSERT_ID() would return 0.
-        ensurePlayerExists(uuid);
-
-        try (Connection conn = dataSource.getConnection()) {
-            DSLContext dsl = dsl(conn);
-
-            // Atomically increment op_seq and set it as LAST_INSERT_ID for this connection
-            String updateSql = String.format(
-                "UPDATE `%s` SET op_seq = LAST_INSERT_ID(op_seq + 1) WHERE uuid = ?", dataTable);
-            dsl.execute(updateSql, uuid.toString());
-
-            // Read back the connection-local LAST_INSERT_ID (no extra DB round-trip for locking)
-            Object result = dsl.fetchValue("SELECT LAST_INSERT_ID()");
-            return result != null ? ((Number) result).longValue() : 1;
         }
     }
 
