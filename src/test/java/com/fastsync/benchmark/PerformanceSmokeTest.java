@@ -187,15 +187,20 @@ class PerformanceSmokeTest {
             byte[] data = new byte[size];
             ThreadLocalRandom.current().nextBytes(data);
 
-            long start = System.nanoTime();
+            // Warm up
+            for (int i = 0; i < 1000; i++) {
+                DatabaseManager.computeChecksum(data);
+            }
+
             int iterations = 10000;
+            long start = System.nanoTime();
             for (int i = 0; i < iterations; i++) {
                 DatabaseManager.computeChecksum(data);
             }
             long elapsed = System.nanoTime() - start;
             // Guard against nanoTime precision issues on some CI runners
             if (elapsed <= 0) elapsed = 1;
-            double throughput = (size * iterations) / (elapsed / 1_000_000_000.0) / (1024 * 1024);
+            double throughput = (double) size * iterations / (elapsed / 1_000_000_000.0) / (1024 * 1024);
 
             System.out.printf("[CRC32] %6d bytes: %.0f MB/s%n", size, throughput);
 
