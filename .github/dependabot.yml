@@ -36,6 +36,13 @@ updates:
       testcontainers:
         patterns:
           - "org.testcontainers:*"
+        # Sub-modules (mysql, junit-jupiter) don't always have 2.0.x releases
+        # when the parent does. Ignore major bumps to avoid broken builds.
+        ignore:
+          - dependency-name: "org.testcontainers:mysql"
+            update-types: ["version-update:semver-major"]
+          - dependency-name: "org.testcontainers:junit-jupiter"
+            update-types: ["version-update:semver-major"]
       mockito:
         patterns:
           - "org.mockito:*"

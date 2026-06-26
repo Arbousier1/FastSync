@@ -64,9 +64,11 @@ dependencies {
     // Test
     testImplementation(platform("org.junit:junit-bom:6.1.0"))
     testImplementation("org.junit.jupiter:junit-jupiter")
+    // Note: testcontainers sub-modules (mysql, junit-jupiter) don't have 2.0.x
+    // releases yet, only the parent POM. Use 1.21.4 for sub-modules.
     testImplementation("org.testcontainers:testcontainers:2.0.5")
-    testImplementation("org.testcontainers:mysql:2.0.5")
-    testImplementation("org.testcontainers:junit-jupiter:2.0.5")
+    testImplementation("org.testcontainers:mysql:1.21.4")
+    testImplementation("org.testcontainers:junit-jupiter:1.21.4")
     testImplementation("org.slf4j:slf4j-simple:2.0.13")
     testImplementation("org.mockito:mockito-core:5.23.0")
     testImplementation("org.mockito:mockito-junit-jupiter:5.23.0")
