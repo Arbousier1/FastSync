@@ -60,6 +60,15 @@ public class RegisteredKeysPdcStrategy implements PdcSyncStrategy {
     /** Max allowed BYTE_ARRAY length in PDC values — guards against corrupted data. */
     private static final int MAX_PDC_VALUE_BYTES = 1024 * 1024; // 1MB
 
+    /**
+     * Upper bound on the entry count read from the restore payload. A corrupted
+     * payload could declare a huge count and make the loop spin reading until
+     * EOF; bounding it turns that into a deterministic rejection (the count is
+     * also bounded by the number of registered keys, so this is a safety cap
+     * rather than a functional limit).
+     */
+    private static final int MAX_PDC_ENTRIES = 256;
+
     @SuppressWarnings({"rawtypes", "unchecked"})
     public RegisteredKeysPdcStrategy(List<KeyBinding> keys, Logger logger, boolean debug) {
         this.logger = logger;
@@ -115,6 +124,27 @@ public class RegisteredKeysPdcStrategy implements PdcSyncStrategy {
     @SuppressWarnings({"rawtypes", "unchecked"})
     public void restore(Player player, byte[] data) {
         if (data == null || data.length == 0) return;
+
+        // Validate the entry count BEFORE touching the player's PDC. A
+        // corrupted payload with an out-of-bounds count is rejected without
+        // even reading the container, so a bad sync cannot wipe good local
+        // data. (The legitimate empty-payload case — count == 0 — is still
+        // allowed through and clears all registered keys below.)
+        int count;
+        try (var bais = new ByteArrayInputStream(data);
+             var in = new DataInputStream(bais)) {
+            count = in.readInt();
+        } catch (IOException e) {
+            if (debug) logger.log(Level.FINE, "[PDC] registered restore rejected (could not read count): " + e.getMessage(), e);
+            return;
+        }
+        if (count < 0 || count > MAX_PDC_ENTRIES) {
+            if (debug) logger.log(Level.FINE, "[PDC] registered restore rejected: count="
+                + count + " out of bounds (max " + MAX_PDC_ENTRIES + ")");
+            return;
+        }
+
+        // Count validated — now safe to touch the player's container.
         PersistentDataContainer pdc = player.getPersistentDataContainer();
 
         // Clear all registered keys before restore to prevent "ghost keys" —
@@ -127,7 +157,8 @@ public class RegisteredKeysPdcStrategy implements PdcSyncStrategy {
 
         try (var bais = new ByteArrayInputStream(data);
              var in = new DataInputStream(bais)) {
-            int count = in.readInt();
+            // Re-read and discard the (already-validated) count.
+            in.readInt();
             for (int i = 0; i < count; i++) {
                 String keyStr = in.readUTF();
                 byte typeId = in.readByte();
