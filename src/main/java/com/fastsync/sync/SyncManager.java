@@ -1763,6 +1763,16 @@ public class SyncManager {
             CompletableFuture<SaveResult> future = new CompletableFuture<>();
             SchedulerUtil.runAtEntity(plugin, player, () -> {
                 try {
+                    // Snapshot dirty state BEFORE collectPlayerData — same
+                    // rationale as savePlayerAsync. BULK (/saveall) is an
+                    // online save (releaseLock=false) and needs epoch
+                    // protection. SHUTDOWN is releaseLock=true and uses
+                    // clearAll() (player is leaving anyway).
+                    final com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot preSaveSnapshot =
+                        (dirtyMask != null && !kind.releaseLock)
+                            ? dirtyMask.snapshotDirty(uuid)
+                            : com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot.EMPTY;
+
                     PlayerData data = collectPlayerData(player);
                     pendingSaveCount.incrementAndGet();
                     java.util.concurrent.locks.ReentrantLock saveLock =
@@ -1777,7 +1787,7 @@ public class SyncManager {
                                     // an in-flight save may have advanced the version
                                     // while we waited for the lock.
                                     refreshVersionAndFencingToken(uuid, data);
-                                    result = persistCollectedData(uuid, data, kind);
+                                    result = persistCollectedData(uuid, data, kind, preSaveSnapshot);
                                 } finally {
                                     saveLock.unlock();
                                 }
@@ -1800,7 +1810,7 @@ public class SyncManager {
                                 saveLock.lock();
                                 try {
                                     refreshVersionAndFencingToken(uuid, data);
-                                    result = persistCollectedData(uuid, data, kind);
+                                    result = persistCollectedData(uuid, data, kind, preSaveSnapshot);
                                 } finally {
                                     saveLock.unlock();
                                 }
@@ -1951,6 +1961,22 @@ public class SyncManager {
 
         // Collect player data on the entity's region thread (Folia-safe)
         SchedulerUtil.runAtEntity(plugin, player, () -> {
+            // CRITICAL: snapshot dirty state BEFORE collectPlayerData runs.
+            // Any markDirty() that arrives during collectPlayerData / serialize /
+            // DB write (on another thread or via a Bukkit event fired from the
+            // collect path itself) will bump the epoch and be PRESERVED by
+            // clearDirty(snapshot) after the save. Without this pre-collect
+            // snapshot, the save would clear dirty bits for changes that the
+            // full Blob does NOT contain — losing them until the next event.
+            //
+            // Only online saves need this. QUIT/SHUTDOWN are releaseLock=true
+            // and use clearAll() unconditionally (player is leaving, no more
+            // changes will arrive).
+            final com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot preSaveSnapshot =
+                (dirtyMask != null && !finalKind.releaseLock)
+                    ? dirtyMask.snapshotDirty(uuid)
+                    : com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot.EMPTY;
+
             PlayerData data = collectPlayerData(player);
 
             pendingSaveCount.incrementAndGet();
@@ -1974,7 +2000,7 @@ public class SyncManager {
                         // and advanced the DB version, this save will CAS-fail with a stale
                         // version and be treated as a serious lock-infringement conflict.
                         refreshVersionAndFencingToken(uuid, data);
-                        persistCollectedData(uuid, data, finalKind);
+                        persistCollectedData(uuid, data, finalKind, preSaveSnapshot);
                     } catch (Exception e) {
                         logger.log(Level.WARNING, finalKind + " save failed for " + uuid, e);
                     } finally {
@@ -2635,6 +2661,50 @@ public class SyncManager {
      * </ul>
      */
     private SaveResult persistCollectedData(UUID uuid, PlayerData data, SaveKind kind) {
+        // For online saves (releaseLock=false), the dirty mask snapshot MUST be
+        // taken BEFORE collectPlayerData() runs — otherwise a dirty signal
+        // produced by an event between collect and DB commit would already be
+        // in the mask when we snapshot, and clearDirty(snapshot) would
+        // correctly preserve it (epoch mismatch). But a signal produced
+        // BEFORE collect started but whose Bukkit event already fired would
+        // be captured in the pre-collect snapshot and could be cleared.
+        //
+        // The correct ordering is: snapshot dirty → collect PlayerData →
+        // serialize → DB write → clearDirty(snapshot). Any markDirty that
+        // arrives after the snapshot (i.e. during collect/serialize/DB write)
+        // bumps the epoch and is preserved.
+        //
+        // For QUIT/SHUTDOWN (releaseLock=true), the player is leaving and will
+        // not produce more changes, so clearAll() is safe and correct.
+        //
+        // This overload takes the snapshot inside the method — it provides
+        // epoch protection for changes during serialize/DB write, but NOT for
+        // changes during collectPlayerData. Callers that have already taken
+        // a pre-collect snapshot should use the 4-arg overload below.
+        com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot preSaveSnapshot =
+            (dirtyMask != null && !kind.releaseLock)
+                ? dirtyMask.snapshotDirty(uuid)
+                : com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot.EMPTY;
+        return persistCollectedData(uuid, data, kind, preSaveSnapshot);
+    }
+
+    /**
+     * Full-Blob save with an explicit pre-collect dirty snapshot.
+     *
+     * <p>Callers that have access to the dirty mask BEFORE calling
+     * {@link #collectPlayerData(Player)} should pass the snapshot they took
+     * at that point — this gives the tightest epoch protection (covers the
+     * collect window too). The 3-arg overload {@link #persistCollectedData(
+     * UUID, PlayerData, SaveKind)} is a convenience that takes the snapshot
+     * inside the method, which still protects the serialize + DB-write window
+     * but not the collect window.
+     *
+     * @param preSaveSnapshot dirty state captured before collectPlayerData.
+     *                        Ignored when {@code kind.releaseLock == true}
+     *                        (QUIT/SHUTDOWN uses clearAll instead).
+     */
+    private SaveResult persistCollectedData(UUID uuid, PlayerData data, SaveKind kind,
+            com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot preSaveSnapshot) {
         long startTime = System.nanoTime();
         // Set save cause for snapshot trigger matching and audit logging
         data.setSaveCause(kind.causeName);
@@ -2815,13 +2885,36 @@ public class SyncManager {
             // for the remainder of the session.
             playersWithBaseline.add(uuid);
 
-            // Full Blob save contains the latest state of all enabled components,
-            // so all dirty flags can be cleared. Without this, a player who was
-            // once marked dirty would stay dirty forever (in component-storage=false
-            // mode), causing every subsequent periodic save to do a full collect +
-            // serialize + DB write — defeating the dirty tracking optimization.
+            // Clear dirty flags using the pre-save snapshot's epoch.
+            //
+            // QUIT / SHUTDOWN (releaseLock=true): the player is leaving and
+            // will not produce more changes, so clearAll() is safe and avoids
+            // leaving a stale mask entry that would never be cleaned.
+            //
+            // Online saves (PERIODIC/BULK/WORLD_SAVE/DEATH): use clearDirty(snapshot)
+            // so that any markDirty() that arrived during collectPlayerData /
+            // serialize / DB write (and bumped the epoch) is PRESERVED. The next
+            // periodic save will re-collect and re-write those components.
+            //
+            // Without this epoch-protected clear, the following race would lose
+            // data:
+            //   T1: periodic save starts, snapshot dirty = {INVENTORY: e5}
+            //   T1: collectPlayerData → serialize → DB write in flight
+            //   T2: player clicks inventory, markDirty(INVENTORY) → e6
+            //   T1: DB write succeeds
+            //   T1: clearAll(uuid)  // ❌ clears INVENTORY even though e6 != e5
+            //   T1: next periodic sees no dirty → skips save
+            //   ⚠ if server crashes before next save, T2's change is lost
+            //
+            // The full Blob just written does NOT contain T2's change because
+            // collectPlayerData ran before T2's event. The dirty bit IS the only
+            // record that T2 happened, so it MUST survive the clear.
             if (dirtyMask != null) {
-                dirtyMask.clearAll(uuid);
+                if (kind.releaseLock || preSaveSnapshot == null) {
+                    dirtyMask.clearAll(uuid);
+                } else {
+                    dirtyMask.clearDirty(uuid, preSaveSnapshot);
+                }
             }
 
                 if (snapshotManager != null && shouldCreateSnapshot(data.getSaveCause())) {

@@ -421,92 +421,53 @@ public class DatabaseManager {
     /**
      * Save player data AND RELEASE the lock (quit/final save).
      *
-     * <p>This is the <b>final save</b> path (player quit / shutdown). After a
-     * successful write the lock is cleared ({@code locked_by = NULL}) so another
-     * server can immediately acquire it. Uses triple CAS:
-     * <ol>
-     *   <li>{@code version = expectedVersion} — optimistic concurrency</li>
-     *   <li>{@code fencing_token = fencingToken} — stale-write defence (Kleppmann)</li>
-     *   <li>{@code locked_by = serverName} — writer currently holds the DB lock</li>
-     * </ol>
+     * <p><b>DEPRECATED.</b> This overload does NOT clear {@code component_bitmap}
+     * or bump {@code component_generation}, so it is unsafe to use if
+     * component-storage was ever enabled for this UUID — stale component rows
+     * would survive the full Blob save and overlay the fresh Blob on next load.
      *
-     * @param uuid            player UUID
-     * @param data            compressed data blob
-     * @param checksum        CRC32 checksum of the uncompressed data
-     * @param expectedVersion the version this data was loaded from
-     * @param fencingToken    the fencing token assigned when the lock was acquired
-     * @param serverName      server writing the data
-     * @return true if saved successfully, false if version conflict or fencing token violation
+     * <p>For safety, this method now delegates to
+     * {@link #saveDataAndReleaseLockClearComponents}, which atomically bumps
+     * the generation. The CAS semantics (version + fencing token + locked_by)
+     * are identical — only two extra columns are written. Existing callers and
+     * tests do not need to change.
+     *
+     * @deprecated since 1.0.0, for removal. Use
+     *             {@link #saveDataAndReleaseLockClearComponents} directly.
      */
+    @Deprecated(since = "1.0.0", forRemoval = true)
     public boolean saveDataAndReleaseLock(UUID uuid, byte[] data, long checksum, long expectedVersion,
                                           long fencingToken, String serverName) throws SQLException {
-        long now = System.currentTimeMillis();
-        try (Connection conn = dataSource.getConnection()) {
-            return dsl(conn).update(playerData)
-                .set(DATA_FIELD, data)
-                .set(VERSION_FIELD, VERSION_FIELD.plus(1))
-                .set(CHECKSUM_FIELD, checksum)
-                .set(LOCKED_BY_FIELD, (String) null)
-                .set(LOCKED_AT_FIELD, (Long) null)
-                .set(LAST_SERVER_FIELD, serverName)
-                .set(LAST_UPDATED_FIELD, now)
-                .where(UUID_FIELD.eq(uuid.toString())
-                    .and(VERSION_FIELD.eq(expectedVersion))
-                    .and(FENCING_TOKEN_FIELD.eq(fencingToken))
-                    .and(LOCKED_BY_FIELD.eq(serverName)))
-                .execute() > 0;
-        }
+        return saveDataAndReleaseLockClearComponents(uuid, data, checksum, expectedVersion, fencingToken, serverName);
     }
 
     /**
      * Save player data AND KEEP the lock (online/periodic/bulk save).
      *
-     * <p>This is the <b>online save</b> path (periodic save, world-save, bulk
-     * save). The player is still online on this server, so the lock MUST be
-     * retained after the write. We refresh {@code locked_at} to prevent the
-     * lock from appearing stale while the player is actively playing.
+     * <p><b>DEPRECATED.</b> Same rationale as
+     * {@link #saveDataAndReleaseLock}: this overload does not invalidate
+     * stale component rows. Delegates to
+     * {@link #saveDataKeepLockClearComponents}.
      *
-     * <p>Uses the same triple CAS as {@link #saveDataAndReleaseLock} but keeps
-     * {@code locked_by} and refreshes {@code locked_at} instead of clearing them.
-     *
-     * @param uuid            player UUID
-     * @param data            compressed data blob
-     * @param checksum        CRC32 checksum of the uncompressed data
-     * @param expectedVersion the version this data was loaded from
-     * @param fencingToken    the fencing token assigned when the lock was acquired
-     * @param serverName      server writing the data
-     * @return true if saved successfully, false if version conflict or fencing token violation
+     * @deprecated since 1.0.0, for removal. Use
+     *             {@link #saveDataKeepLockClearComponents} directly.
      */
+    @Deprecated(since = "1.0.0", forRemoval = true)
     public boolean saveDataKeepLock(UUID uuid, byte[] data, long checksum, long expectedVersion,
                                     long fencingToken, String serverName) throws SQLException {
-        long now = System.currentTimeMillis();
-        try (Connection conn = dataSource.getConnection()) {
-            return dsl(conn).update(playerData)
-                .set(DATA_FIELD, data)
-                .set(VERSION_FIELD, VERSION_FIELD.plus(1))
-                .set(CHECKSUM_FIELD, checksum)
-                .set(LAST_SERVER_FIELD, serverName)
-                .set(LAST_UPDATED_FIELD, now)
-                .set(LOCKED_AT_FIELD, now)  // refresh lock timestamp while player is online
-                // locked_by is NOT cleared — we still hold the lock
-                .where(UUID_FIELD.eq(uuid.toString())
-                    .and(VERSION_FIELD.eq(expectedVersion))
-                    .and(FENCING_TOKEN_FIELD.eq(fencingToken))
-                    .and(LOCKED_BY_FIELD.eq(serverName)))
-                .execute() > 0;
-        }
+        return saveDataKeepLockClearComponents(uuid, data, checksum, expectedVersion, fencingToken, serverName);
     }
 
     /**
      * Save player data and release the lock (legacy/backward-compatible alias).
      *
-     * @deprecated Use {@link #saveDataAndReleaseLock} for quit saves or
-     *             {@link #saveDataKeepLock} for online/periodic saves.
+     * @deprecated since 1.0.0, for removal. Use
+     *             {@link #saveDataAndReleaseLockClearComponents} directly.
      */
-    @Deprecated
+    @Deprecated(since = "1.0.0", forRemoval = true)
     public boolean saveData(UUID uuid, byte[] data, long checksum, long expectedVersion,
                             long fencingToken, String serverName) throws SQLException {
-        return saveDataAndReleaseLock(uuid, data, checksum, expectedVersion, fencingToken, serverName);
+        return saveDataAndReleaseLockClearComponents(uuid, data, checksum, expectedVersion, fencingToken, serverName);
     }
 
     // ==================== Phase 2: Full Blob Save + Component Cleanup ====================
@@ -900,16 +861,29 @@ public class DatabaseManager {
 
     /**
      * Update the {@code component_bitmap} column for a player.
-     * Called after a component is written to {@code player_component} for the
-     * first time, marking it as migrated.
+     *
+     * <p><b>DEPRECATED &amp; DANGEROUS.</b> This method writes
+     * {@code component_bitmap} directly with no fencing validation, no version
+     * bump, no transaction, and no {@code component_generation} update. Any
+     * caller could use it to mark components as migrated without actually
+     * writing them — causing the load path to look for component rows that do
+     * not exist (silent fall-back to Blob) or, worse, to skip the Blob's value
+     * for a component that was never persisted to the component table.
+     *
+     * <p>The only safe way to update {@code component_bitmap} is inside
+     * {@link #upsertComponentsIfLockHeld}, which does it atomically with the
+     * component row writes, the version bump, and the fencing validation.
+     *
+     * @deprecated since 1.0.0, for removal. Use
+     *             {@link #upsertComponentsIfLockHeld(UUID, java.util.Map, java.util.Map, String, long, long)}.
+     * @throws UnsupportedOperationException always.
      */
+    @Deprecated(since = "1.0.0", forRemoval = true)
     public void setComponentBitmap(UUID uuid, long bitmap) throws SQLException {
-        try (Connection conn = dataSource.getConnection()) {
-            dsl(conn).update(playerData)
-                .set(COMPONENT_BITMAP_FIELD, bitmap)
-                .where(UUID_FIELD.eq(uuid.toString()))
-                .execute();
-        }
+        throw new UnsupportedOperationException(
+            "setComponentBitmap() is unsafe — it writes component_bitmap directly with no fencing "
+            + "validation, no version bump, and no component row write. Use upsertComponentsIfLockHeld() "
+            + "instead, which updates component_bitmap atomically with the component rows.");
     }
 
     /**
