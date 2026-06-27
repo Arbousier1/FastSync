@@ -283,4 +283,100 @@ class ComponentDirtyMaskTest {
         mask.clearDirty(player2, snapshot);
         assertFalse(mask.isAnyDirty(player2));
     }
+
+    /**
+     * Reproduces the P0 race that the new full-save epoch clear prevents.
+     *
+     * <p>Before the fix, {@code persistCollectedData} called
+     * {@code dirtyMask.clearAll(uuid)} unconditionally after a successful
+     * full Blob save. This lost any markDirty that arrived during the
+     * collect/serialize/DB-write window — the full Blob did not contain
+     * the new change (collect ran first), and the dirty bit was the only
+     * record that the change happened.
+     *
+     * <p>The fix takes a DirtySnapshot BEFORE collectPlayerData and uses
+     * {@code clearDirty(snapshot)} instead of {@code clearAll}. This test
+     * simulates the exact sequence:
+     *
+     * <pre>
+     *   1. markDirty(INVENTORY)              // pre-existing dirty
+     *   2. snapshot = snapshotDirty()         // taken before collect
+     *   3. (collectPlayerData + serialize + DB write — no mask access)
+     *   4. markDirty(INVENTORY)               // change arrives DURING save
+     *   5. clearDirty(snapshot)               // epoch-protected clear
+     *
+     *   → INVENTORY must still be dirty (epoch was bumped in step 4)
+     * </pre>
+     *
+     * <p>Without epoch protection (i.e. clearAll), step 5 would clear
+     * INVENTORY and the change from step 4 would be silently lost.
+     */
+    @Test
+    void testFullSaveEpochClearPreservesDirtyArrivingDuringSave() {
+        // Step 1: pre-existing dirty
+        mask.markDirty(player1, ComponentDirtyMask.Component.INVENTORY);
+
+        // Step 2: snapshot before collect (this is what savePlayerAsync does)
+        ComponentDirtyMask.DirtySnapshot preSaveSnapshot = mask.snapshotDirty(player1);
+        assertEquals(1, preSaveSnapshot.size());
+
+        // Step 3: (simulated collect + serialize + DB write — nothing to do)
+
+        // Step 4: change arrives during the save window
+        mask.markDirty(player1, ComponentDirtyMask.Component.INVENTORY);
+
+        // Step 5: epoch-protected clear (what the fixed persistCollectedData does
+        //         for online saves)
+        mask.clearDirty(player1, preSaveSnapshot);
+
+        // The change from step 4 must survive — its epoch differs from the snapshot
+        assertTrue(mask.isAnyDirty(player1),
+            "INVENTORY must remain dirty — markDirty during save bumped the epoch "
+            + "and must not be cleared by clearDirty(snapshot)");
+        assertTrue(mask.getDirty(player1).contains(ComponentDirtyMask.Component.INVENTORY));
+    }
+
+    /**
+     * Sanity check: clearAll (used by QUIT/SHUTDOWN) DOES clear everything,
+     * including changes that arrived during the save. This is correct for
+     * QUIT because the player is leaving and will not produce more changes,
+     * and the QUIT save's collectPlayerData captured the latest state.
+     */
+    @Test
+    void testQuitClearAllClearsEverything() {
+        mask.markDirty(player1, ComponentDirtyMask.Component.INVENTORY);
+        // Simulate: collect happened, then a late markDirty arrives,
+        // then QUIT save completes and calls clearAll.
+        mask.markDirty(player1, ComponentDirtyMask.Component.INVENTORY);
+        mask.clearAll(player1);
+        assertFalse(mask.isAnyDirty(player1),
+            "QUIT clearAll should clear all dirty state — player is leaving");
+    }
+
+    /**
+     * Multi-component variant: only the component whose epoch was bumped
+     * during the save survives the epoch-protected clear.
+     */
+    @Test
+    void testFullSaveEpochClearWithMultipleComponents() {
+        mask.markDirty(player1, ComponentDirtyMask.Component.INVENTORY);
+        mask.markDirty(player1, ComponentDirtyMask.Component.VITALS);
+        mask.markDirty(player1, ComponentDirtyMask.Component.EXPERIENCE);
+
+        ComponentDirtyMask.DirtySnapshot preSaveSnapshot = mask.snapshotDirty(player1);
+
+        // During save: only INVENTORY gets a new markDirty
+        mask.markDirty(player1, ComponentDirtyMask.Component.INVENTORY);
+
+        mask.clearDirty(player1, preSaveSnapshot);
+
+        Set<ComponentDirtyMask.Component> dirty = mask.getDirty(player1);
+        assertEquals(1, dirty.size(),
+            "Only INVENTORY (epoch bumped during save) should remain dirty");
+        assertTrue(dirty.contains(ComponentDirtyMask.Component.INVENTORY));
+        assertFalse(dirty.contains(ComponentDirtyMask.Component.VITALS),
+            "VITALS epoch matched snapshot — cleared");
+        assertFalse(dirty.contains(ComponentDirtyMask.Component.EXPERIENCE),
+            "EXPERIENCE epoch matched snapshot — cleared");
+    }
 }
