@@ -2467,6 +2467,34 @@ public class SyncManager {
      * @return SaveResult on success, null to fall back to full save
      */
     private SaveResult persistComponentsOnly(UUID uuid, PlayerData data, SaveKind kind) {
+        // Backward-compatible overload: takes the snapshot inside the method.
+        // Callers on the save path should use the 4-arg overload and pass a
+        // snapshot taken BEFORE collectPlayerData, so the epoch protection
+        // covers the collect window too. This overload is kept for safety
+        // (any future caller that forgets the snapshot still gets serialize+
+        // DB-write window protection, just not collect-window protection).
+        com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot snapshot =
+            dirtyMask != null ? dirtyMask.snapshotDirty(uuid)
+                              : com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot.EMPTY;
+        return persistComponentsOnly(uuid, data, kind, snapshot);
+    }
+
+    /**
+     * Component-only save with an explicit pre-collect dirty snapshot.
+     *
+     * <p>The snapshot MUST be taken BEFORE {@link #collectPlayerData(Player)}
+     * runs. If it is taken after collect, a markDirty that arrived during
+     * collect would already be in the snapshot, and clearDirty(snapshot)
+     * after the DB write would clear it — losing the change (the component
+     * row was written from the pre-collect PlayerData, which does not
+     * contain the change).
+     *
+     * <p>See {@link #persistCollectedData(UUID, PlayerData, SaveKind,
+     * com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot)} for the
+     * full rationale.
+     */
+    private SaveResult persistComponentsOnly(UUID uuid, PlayerData data, SaveKind kind,
+            com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot dirtySnapshot) {
         try {
             // CRITICAL safety gate: refuse to do a component-only save unless the
             // player already has a non-empty full-Blob baseline in player_data.
@@ -2489,13 +2517,9 @@ public class SyncManager {
                 return null;
             }
 
-            // Snapshot dirty set WITH epochs. The epoch is what protects us
-            // from the lost-update race where a markDirty() arrives while the
-            // DB write is in flight — clearDirty(snapshot) will only clear
-            // components whose epoch still matches, preserving the new signal.
-            com.fastsync.sync.dirty.ComponentDirtyMask.DirtySnapshot dirtySnapshot =
-                dirtyMask.snapshotDirty(uuid);
-            if (dirtySnapshot.isEmpty()) {
+            // Use the caller-provided snapshot (taken before collectPlayerData).
+            // See method javadoc for why this must NOT be re-snapshot here.
+            if (dirtySnapshot == null || dirtySnapshot.isEmpty()) {
                 return null;  // nothing dirty, fall back (shouldn't happen — caller checks)
             }
             java.util.Set<com.fastsync.sync.dirty.ComponentDirtyMask.Component> dirty =
@@ -2724,7 +2748,13 @@ public class SyncManager {
             && dirtyMask != null
             && !kind.releaseLock
             && dirtyMask.isAnyDirty(uuid)) {
-            SaveResult componentResult = persistComponentsOnly(uuid, data, kind);
+            // Pass the caller-provided snapshot (taken before collectPlayerData)
+            // so persistComponentsOnly's clearDirty after the DB write protects
+            // changes that arrived during collect/serialize/DB-write. If we
+            // let persistComponentsOnly re-snapshot here, the snapshot would be
+            // taken AFTER collect and could include changes the component row
+            // does NOT contain — clearing them would lose data.
+            SaveResult componentResult = persistComponentsOnly(uuid, data, kind, preSaveSnapshot);
             if (componentResult != null) {
                 return componentResult;
             }
