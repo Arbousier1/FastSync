@@ -19,17 +19,19 @@ import static org.junit.jupiter.api.Assertions.*;
  * {@link NoClassDefFoundError}, etc.) are recorded before the worker thread
  * dies — otherwise they would be invisible to operators tailing the log file.
  *
- * <p>Since the test cannot safely throw real Errors (they crash the JVM or
- * test runner), it throws a custom {@link Throwable} subclass and verifies
- * the log handler receives a SEVERE record containing the message.
+ * <p>The test uses a custom {@link Error} subtype so the lambda still matches
+ * {@link Runnable} while exercising the "catch Throwable, not just
+ * Exception" behavior. It then verifies the log handler receives a SEVERE
+ * record containing the message.
  */
 class AsyncExecutorThrowableTest {
 
     /**
-     * Custom Throwable subclass for testing purposes. Not an Error or
-     * Exception, so previous catch(Exception) code would have missed it.
+     * Custom Error subtype for testing purposes. This still bypasses
+     * catch(Exception) code paths, but can be thrown from a Runnable lambda
+     * without checked-exception boilerplate.
      */
-    private static class TestThrowable extends Throwable {
+    private static class TestThrowable extends Error {
         TestThrowable(String message) {
             super(message);
         }
