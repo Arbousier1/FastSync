@@ -15,7 +15,6 @@ import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -102,13 +101,19 @@ public class FileOperationLogManager {
      * the save/load path or throw. The SQL DB remains the source of truth;
      * the operation log is an audit aid.
      */
-    private final ExecutorService appendExecutor;
+    private final ThreadPoolExecutor appendExecutor;
 
     /** Per-UUID locks to serialize appends and ensure ordering. */
     private final ConcurrentHashMap<UUID, Object> appendLocks = new ConcurrentHashMap<>();
 
     /** Per-UUID monotonic sequence counter (session-scoped, starts at 0). */
     private final ConcurrentHashMap<UUID, AtomicLong> seqCounters = new ConcurrentHashMap<>();
+
+    /** Number of queued log entries dropped due to append queue saturation. */
+    private final AtomicLong droppedCount = new AtomicLong();
+
+    /** Wall-clock time of the last dropped log entry, or 0 if none have dropped. */
+    private final AtomicLong lastDropTimestamp = new AtomicLong();
 
     private volatile boolean initialized = false;
     private volatile boolean closed = false;
@@ -120,7 +125,7 @@ public class FileOperationLogManager {
         this.appendExecutor = createAppendExecutor();
     }
 
-    private static ExecutorService createAppendExecutor() {
+    private ThreadPoolExecutor createAppendExecutor() {
         AtomicInteger counter = new AtomicInteger(0);
         java.util.concurrent.ThreadFactory factory = r -> {
             Thread t = new Thread(r, "FastSync-OpLog-" + counter.getAndIncrement());
@@ -133,7 +138,26 @@ public class FileOperationLogManager {
             30L, TimeUnit.SECONDS,
             new ArrayBlockingQueue<>(4096),
             factory,
-            new ThreadPoolExecutor.DiscardOldestPolicy());
+            (task, executor) -> {
+                if (closed || executor.isShutdown()) {
+                    throw new java.util.concurrent.RejectedExecutionException(
+                        "FileOperationLogManager append executor is shutting down");
+                }
+                Runnable dropped = executor.getQueue().poll();
+                if (dropped != null) {
+                    long drops = droppedCount.incrementAndGet();
+                    lastDropTimestamp.set(System.currentTimeMillis());
+                    if (drops == 1 || drops % 100 == 0) {
+                        logger.warning("[OpLog] Append queue full; dropped " + drops
+                            + " queued log entr" + (drops == 1 ? "y" : "ies")
+                            + " so far. This log is best-effort only.");
+                    }
+                }
+                if (!executor.getQueue().offer(task)) {
+                    throw new java.util.concurrent.RejectedExecutionException(
+                        "FileOperationLogManager append queue remained full after dropping oldest entry");
+                }
+            });
     }
 
     public void initialize() {
@@ -388,5 +412,21 @@ public class FileOperationLogManager {
         appendLocks.clear();
         seqCounters.clear();
         logger.info("[OpLog] File operation log closed.");
+    }
+
+    public long getDroppedCount() {
+        return droppedCount.get();
+    }
+
+    public long getLastDropTimestamp() {
+        return lastDropTimestamp.get();
+    }
+
+    public int getQueueSize() {
+        return appendExecutor.getQueue().size();
+    }
+
+    public int getQueueCapacity() {
+        return appendExecutor.getQueue().remainingCapacity() + appendExecutor.getQueue().size();
     }
 }

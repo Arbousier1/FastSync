@@ -40,6 +40,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.io.IOException;
@@ -101,6 +102,13 @@ public class SyncManager {
     private final ConcurrentHashMap<UUID, PlayerData> pendingData = new ConcurrentHashMap<>();
     private final java.util.Set<UUID> pendingEmptyData = ConcurrentHashMap.newKeySet();
     private final ConcurrentHashMap<UUID, Long> pendingLoadTimes = new ConcurrentHashMap<>();
+
+    // Final-save saturation telemetry. A queue-full event on finalSaveExecutor
+    // immediately causes a synchronous fallback today, so we count both the
+    // rejection and the fallback and surface them in /fastsync status.
+    private final AtomicLong finalSaveQueueFullTotal = new AtomicLong();
+    private final AtomicLong finalSaveSyncFallbackTotal = new AtomicLong();
+    private final AtomicLong finalSaveLastFallbackAt = new AtomicLong();
 
     // Track players whose data has been applied (actively playing)
     private final ConcurrentHashMap<UUID, Boolean> activePlayers = new ConcurrentHashMap<>();
@@ -643,6 +651,7 @@ public class SyncManager {
                     // Load only components matching the current generation
                     java.util.Map<String, com.fastsync.database.DatabaseManager.ComponentData> components =
                         databaseManager.loadComponentsWithGeneration(uuid, migratedNames, generation);
+                    verifyComponentOverlayCompleteness(uuid, migratedNames, components, generation);
                     // FAIL-CLOSED: any component checksum mismatch / unwrap
                     // failure / deserialize failure makes the WHOLE load fail.
                     // The old behavior (warn + continue) silently applied the
@@ -1171,10 +1180,12 @@ public class SyncManager {
             // synchronously on the current thread (PlayerQuitEvent is on
             // main/region thread). This blocks the tick loop, but losing the
             // player's final state is worse. Log at SEVERE so this is visible.
-            logger.log(Level.SEVERE, "[FinalSave] Final-save executor rejected QUIT save for "
-                + uuid + " — running synchronously on event thread as last-resort fallback. "
-                + "This blocks the game tick; investigate DB latency or raise "
-                + "database.queue-capacity.", e);
+            recordFinalSaveSynchronousFallback(
+                "QUIT", uuid,
+                "running synchronously on event thread as last-resort fallback. "
+                    + "This blocks the game tick; investigate DB latency or raise "
+                    + "database.queue-capacity.",
+                e);
             saveLock.lock();
             try {
                 refreshVersionAndFencingToken(uuid, data);
@@ -1980,9 +1991,11 @@ public class SyncManager {
                             // The final-save queue is full, but shutdown cannot
                             // skip saves. Log at SEVERE: this runs DB I/O on the
                             // entity/global thread and blocks the tick loop.
-                            logger.log(Level.SEVERE, "[Shutdown] Final-save executor queue full for " + uuid
-                                + " — running synchronously on event thread as fallback. "
-                                + "Investigate DB latency or raise database.queue-capacity.", e);
+                            recordFinalSaveSynchronousFallback(
+                                "SHUTDOWN", uuid,
+                                "running synchronously on event thread as fallback. "
+                                    + "Investigate DB latency or raise database.queue-capacity.",
+                                e);
                             SaveResult result;
                             try {
                                 saveLock.lock();
@@ -3666,6 +3679,54 @@ public class SyncManager {
         return asyncExecutor != null ? asyncExecutor.getQueueSize() : -1;
     }
 
+    public int getFinalSaveActiveCount() {
+        return finalSaveExecutor != null ? finalSaveExecutor.getActiveCount() : -1;
+    }
+
+    public int getFinalSaveQueueSize() {
+        return finalSaveExecutor != null ? finalSaveExecutor.getQueueSize() : -1;
+    }
+
+    public int getFinalSaveQueueCapacity() {
+        return finalSaveExecutor != null ? finalSaveExecutor.getQueueCapacity() : -1;
+    }
+
+    public long getFinalSaveQueueFullTotal() {
+        return finalSaveQueueFullTotal.get();
+    }
+
+    public long getFinalSaveSyncFallbackTotal() {
+        return finalSaveSyncFallbackTotal.get();
+    }
+
+    public long getFinalSaveLastFallbackAt() {
+        return finalSaveLastFallbackAt.get();
+    }
+
+    public boolean hasFinalSaveAlert() {
+        return finalSaveSyncFallbackTotal.get() > 0;
+    }
+
+    public boolean isOperationLogEnabled() {
+        return operationLogManager != null && operationLogManager.isEnabled();
+    }
+
+    public int getOperationLogQueueSize() {
+        return operationLogManager != null ? operationLogManager.getQueueSize() : -1;
+    }
+
+    public int getOperationLogQueueCapacity() {
+        return operationLogManager != null ? operationLogManager.getQueueCapacity() : -1;
+    }
+
+    public long getOperationLogDroppedTotal() {
+        return operationLogManager != null ? operationLogManager.getDroppedCount() : 0L;
+    }
+
+    public long getOperationLogLastDropAt() {
+        return operationLogManager != null ? operationLogManager.getLastDropTimestamp() : 0L;
+    }
+
     /**
      * Log an operation to the per-UUID operation log (Raft-inspired).
      * Non-blocking — logging never blocks the main save/load path.
@@ -3682,6 +3743,31 @@ public class SyncManager {
                     return null;
                 });
         }
+    }
+
+    static void verifyComponentOverlayCompleteness(
+            UUID uuid,
+            java.util.Set<String> expectedComponents,
+            java.util.Map<String, com.fastsync.database.DatabaseManager.ComponentData> loadedComponents,
+            long generation) throws IOException {
+        java.util.Set<String> missingComponents = new java.util.HashSet<>(expectedComponents);
+        missingComponents.removeAll(loadedComponents.keySet());
+        if (!missingComponents.isEmpty()) {
+            throw new IOException("component_bitmap references missing rows for " + uuid
+                + " (gen=" + generation + "): " + missingComponents);
+        }
+    }
+
+    private void recordFinalSaveSynchronousFallback(
+            String kind, UUID uuid, String detail,
+            java.util.concurrent.RejectedExecutionException cause) {
+        long queueFullCount = finalSaveQueueFullTotal.incrementAndGet();
+        long fallbackCount = finalSaveSyncFallbackTotal.incrementAndGet();
+        finalSaveLastFallbackAt.set(System.currentTimeMillis());
+        logger.log(Level.SEVERE, "[FinalSave] Final-save executor rejected " + kind + " save for "
+            + uuid + " — " + detail
+            + " (queueFullTotal=" + queueFullCount
+            + ", syncFallbackTotal=" + fallbackCount + ")", cause);
     }
 
     /**

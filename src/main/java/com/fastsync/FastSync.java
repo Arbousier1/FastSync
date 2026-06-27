@@ -439,6 +439,33 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         sender.sendMessage(ChatColor.YELLOW + "Async threads: " + ChatColor.WHITE +
             "active=" + syncManager.getAsyncActiveCount() +
             ", queue=" + syncManager.getAsyncQueueSize());
+        ChatColor finalSaveColor = syncManager.hasFinalSaveAlert() ? ChatColor.RED : ChatColor.GREEN;
+        sender.sendMessage(ChatColor.YELLOW + "Final-save: " + finalSaveColor +
+            "active=" + syncManager.getFinalSaveActiveCount() +
+            ", queue=" + syncManager.getFinalSaveQueueSize() + "/" + syncManager.getFinalSaveQueueCapacity() +
+            ", queueFull=" + syncManager.getFinalSaveQueueFullTotal() +
+            ", syncFallback=" + syncManager.getFinalSaveSyncFallbackTotal());
+        if (syncManager.hasFinalSaveAlert()) {
+            long lastFallbackAt = syncManager.getFinalSaveLastFallbackAt();
+            sender.sendMessage(ChatColor.RED + "Final-save ALERT: synchronous fallback occurred"
+                + (lastFallbackAt > 0 ? " at " + new java.util.Date(lastFallbackAt) : "")
+                + ". Investigate DB latency / queue sizing before scaling up.");
+        }
+        if (configManager.isOperationLogEnabled()) {
+            long dropped = syncManager.getOperationLogDroppedTotal();
+            ChatColor opLogColor = dropped > 0 ? ChatColor.RED : ChatColor.GREEN;
+            sender.sendMessage(ChatColor.YELLOW + "OpLog: " + opLogColor +
+                "queue=" + syncManager.getOperationLogQueueSize() + "/" + syncManager.getOperationLogQueueCapacity() +
+                ", dropped=" + dropped);
+            if (dropped > 0) {
+                long lastDropAt = syncManager.getOperationLogLastDropAt();
+                sender.sendMessage(ChatColor.RED + "OpLog ALERT: audit entries have been dropped"
+                    + (lastDropAt > 0 ? " since " + new java.util.Date(lastDropAt) : "")
+                    + ". Treat operation log as incomplete for incident review.");
+            }
+        } else {
+            sender.sendMessage(ChatColor.YELLOW + "OpLog: " + ChatColor.GRAY + "Disabled");
+        }
         sender.sendMessage(ChatColor.YELLOW + "Compression: " +
             (configManager.isCompressionEnabled() ? ChatColor.GREEN + "LZ4" : ChatColor.RED + "Disabled"));
         sender.sendMessage(ChatColor.YELLOW + "Debug: " +
