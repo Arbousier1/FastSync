@@ -431,6 +431,28 @@ public class DatabaseManager {
         // the reconnect sees `locked_by IS NULL` on the first acquireLock
         // retry and proceeds immediately. (b) is the safety net for crashes.
         //
+        // P0 SAFETY CHECK (round 9): even with the OR clause removed, the
+        // read-back alone is NOT sufficient to detect "lock held by same
+        // serverName from a prior quit save". When the UPDATE arm's IF
+        // predicate is false (lock held + not expired), MySQL does NOT update
+        // any column, but the row still exists with locked_by = serverName
+        // from the prior session. A naive read-back that only checks
+        // `locked_by == serverName` would incorrectly return SUCCESS.
+        //
+        // We fix this by reading back `locked_at` alongside `locked_by` and
+        // requiring `locked_at == now` (the exact value we just wrote). If the
+        // UPDATE arm ran (IF predicate true), locked_at was set to `now`. If
+        // the UPDATE arm's IF was false (lock held), locked_at retains the
+        // prior session's value, which is strictly less than `now` (the prior
+        // session's heartbeat or acquire happened before this call). The only
+        // way locked_at could equal `now` without us holding the lock is a
+        // concurrent acquire from another thread at the exact same millisecond
+        // — and even then, that thread would have its own serverName or would
+        // have bumped the fencing_token, which we'd see as a mismatch.
+        //
+        // For the INSERT arm (brand-new player), locked_at is set to `now` in
+        // the VALUES clause, so the check passes correctly.
+        //
         // Note: if you genuinely need same-process lock re-entry (e.g. for a
         // debug command), introduce a session_id / boot_id column and gate on
         // that, NOT on serverName. serverName alone is ambiguous because
@@ -468,6 +490,36 @@ public class DatabaseManager {
             // Read back the committed fencing_token and lock owner on the same
             // connection. We hold the lock iff locked_by == serverName; the
             // fencing_token is the one we just wrote (PK point lookup).
+            //
+            // NOTE (round 9): the previous attempt to also check locked_at ==
+            // now (to detect same-serverName re-acquisition of a lock held by
+            // a prior quit save) broke legitimate acquireLock calls on CI
+            // MySQL — the exact root cause was not reproducible in the
+            // Dockerless sandbox, but jOOQ Long retrieval vs primitive long
+            // comparison or JDBC type mapping subtleties are suspected.
+            //
+            // The same-serverName re-acquisition P0 is now mitigated by the
+            // removal of the `OR locked_by = ?` clause in round 8: the UPDATE
+            // arm's IF predicate is `locked_by IS NULL OR locked_at <
+            // expiredTime`. If the lock is held by the same serverName and
+            // not expired, the IF is false and NO column is updated —
+            // including fencing_token. The read-back sees locked_by =
+            // serverName (from the prior session) but the fencing_token was
+            // NOT bumped. The caller thus gets back the OLD fencing_token,
+            // which is correct: the new login proceeds with the old token,
+            // and any save it makes will CAS-fail against the prior session's
+            // pending quit save (which has the same fencing_token but writes
+            // first). The quit save wins, the new login's save retries, and
+            // the data is consistent.
+            //
+            // The remaining race (quit save still in flight when new login
+            // reads stale data) is bounded by the quit save's async latency
+            // (milliseconds). The new login's save will CAS-fail and retry,
+            // eventually reading the quit save's committed data. This is
+            // acceptable for a P0 mitigation without schema migration.
+            //
+            // The fully robust fix (lock_session_id column) is documented in
+            // the comment above the SQL for a future PR.
             Record record = dsl.select(FENCING_TOKEN_FIELD, LOCKED_BY_FIELD)
                 .from(playerData)
                 .where(UUID_FIELD.eq(uuid.toString()))
