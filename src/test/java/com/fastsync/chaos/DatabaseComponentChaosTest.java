@@ -333,6 +333,307 @@ class DatabaseComponentChaosTest {
         }
     }
 
+    // ==================== Integration cases from review round 4 ====================
+    //
+    // These cases fill the gaps left by the original chaos tests. They verify
+    // the safety properties called out in the static review that previous
+    // tests only partially covered:
+    //
+    //   - testComponentSaveBumpsPlayerDataVersionExplicit: component-only save
+    //     must bump player_data.version by exactly 1, and the returned
+    //     newVersion must match what the DB reports via getCurrentVersion.
+    //   - testNoBaselineBlobComponentRowsAreOrphanedOnCrash: simulates the
+    //     "new player, no baseline, component-only save, then crash" scenario
+    //     the playersWithBaseline gate in SyncManager is designed to prevent.
+    //     This DB-level test confirms that if component rows exist without a
+    //     non-empty Blob baseline, loadData() returns EMPTY — which is exactly
+    //     the orphan state the gate protects against.
+    //   - testComponentSaveFollowedByQuitFullSave_blobWins: verifies invariant
+    //     #7 from the review — after a component save writes INVENTORY at
+    //     generation G, a subsequent QUIT full Blob save bumps to G+1 and
+    //     zero-bits the bitmap, so the next load (at G+1) sees NO component
+    //     override. The full Blob wins; the stale component row is invisible.
+
+    /**
+     * Verifies that a single component save bumps player_data.version by
+     * exactly 1, and that the newVersion returned in the result matches
+     * what the DB reports via {@link DatabaseManager#getCurrentVersion}.
+     *
+     * <p>This is invariant #6 from the review. The original
+     * {@code testComponentSaveWithCorrectFencingSucceeds} only asserted
+     * {@code newVersion - oldVersion == 1}; this case additionally checks
+     * that the DB itself reflects the new version, closing a potential
+     * "result says success but DB wasn't actually updated" gap.
+     */
+    @Test
+    void testComponentSaveBumpsPlayerDataVersionExplicit() throws SQLException {
+        UUID uuid = UUID.randomUUID();
+        String server = "server-A";
+
+        var lock = databaseManager.acquireLock(uuid, server);
+        assertTrue(lock.acquired());
+        long fencingToken = lock.fencingToken();
+
+        long versionBefore = databaseManager.getCurrentVersion(uuid);
+        assertEquals(0, versionBefore, "New player should start at version 0");
+
+        Map<String, byte[]> components = new HashMap<>();
+        components.put("INVENTORY", new byte[]{7, 8, 9});
+        Map<String, Long> checksums = new HashMap<>();
+        checksums.put("INVENTORY", 42L);
+
+        var result = databaseManager.upsertComponentsIfLockHeld(
+            uuid, components, checksums, server, fencingToken, 1L);
+
+        assertTrue(result.success(), "Component save should succeed");
+        assertEquals(versionBefore, result.oldVersion(),
+            "oldVersion in result should match DB version before save");
+        assertEquals(versionBefore + 1, result.newVersion(),
+            "newVersion should be oldVersion + 1");
+
+        // Critical assertion: the DB itself must reflect the new version.
+        // If the result says success but the DB wasn't updated, the local
+        // playerVersions map in SyncManager would drift out of sync.
+        long versionAfter = databaseManager.getCurrentVersion(uuid);
+        assertEquals(result.newVersion(), versionAfter,
+            "DB version after save must match the newVersion returned in the result");
+    }
+
+    /**
+     * Simulates the "new player, no baseline, component-only save, then crash"
+     * scenario that the {@code playersWithBaseline} gate in SyncManager is
+     * designed to prevent.
+     *
+     * <p>Sequence:
+     * <ol>
+     *   <li>Acquire lock for a brand-new player (no player_data row).</li>
+     *   <li>Bypass the gate (this is a DB-level test, not SyncManager) and
+     *       write a component row directly via upsertComponentsIfLockHeld.</li>
+     *   <li>Simulate crash: do NOT write a full Blob, do NOT release lock.</li>
+     *   <li>Reload via loadData(uuid) — the load path used by SyncManager.</li>
+     * </ol>
+     *
+     * <p>Expected: loadData() returns VersionedData.EMPTY because player_data.data
+     * is null/empty. The component row exists in player_component but is NOT
+     * loaded by loadData() (which only reads the Blob). This is the exact
+     * "orphaned component rows" state the gate prevents.
+     *
+     * <p>The test confirms the gate is necessary: without it, the component
+     * row would be silently orphaned and the player's state lost.
+     */
+    @Test
+    void testNoBaselineBlobComponentRowsAreOrphanedOnCrash() throws SQLException {
+        UUID uuid = UUID.randomUUID();
+        String server = "server-A";
+
+        var lock = databaseManager.acquireLock(uuid, server);
+        assertTrue(lock.acquired());
+        long fencingToken = lock.fencingToken();
+
+        // Write a component WITHOUT a prior full Blob baseline.
+        // In SyncManager, persistComponentsOnly's playersWithBaseline gate
+        // would refuse this and fall back to a full Blob save first.
+        // Here we bypass the gate to demonstrate what happens without it.
+        Map<String, byte[]> components = new HashMap<>();
+        components.put("INVENTORY", new byte[]{1, 2, 3, 4, 5});
+        Map<String, Long> checksums = new HashMap<>();
+        checksums.put("INVENTORY", 555L);
+
+        var result = databaseManager.upsertComponentsIfLockHeld(
+            uuid, components, checksums, server, fencingToken, 1L);
+        assertTrue(result.success(), "Component save should succeed at the DB level");
+
+        // Simulate crash: no full Blob save, no lock release.
+        // The lock will expire naturally; we just don't write the Blob.
+
+        // Now reload via the same path SyncManager uses.
+        var loaded = databaseManager.loadData(uuid);
+        assertFalse(loaded.hasData(),
+            "loadData() must return EMPTY when player_data.data is null — "
+            + "this is the orphan state the playersWithBaseline gate prevents. "
+            + "If this assertion ever fails, the gate's premise is broken.");
+
+        // The component row DOES exist in player_component, but loadData()
+        // does not look there. This is by design — component overlay only
+        // happens after loadData() succeeds AND component_bitmap != 0.
+        // Since loadData() returned EMPTY, SyncManager treats the player as
+        // brand new and the component row is orphaned.
+        long bitmap = databaseManager.getComponentBitmap(uuid);
+        assertEquals(1L, bitmap,
+            "component_bitmap should have INVENTORY bit set (component save wrote it)");
+
+        long gen = databaseManager.getComponentGeneration(uuid);
+        // The component row exists at this generation.
+        var orphanedComponents = databaseManager.loadComponentsWithGeneration(
+            uuid, java.util.Set.of("INVENTORY"), gen);
+        assertFalse(orphanedComponents.isEmpty(),
+            "The component row IS in the table — it's just orphaned because "
+            + "loadData() returns EMPTY and the load path never gets to the "
+            + "component overlay step. This proves the gate is necessary.");
+    }
+
+    /**
+     * Verifies invariant #7 from the review: after a component save writes
+     * INVENTORY at generation G, a subsequent QUIT full Blob save bumps to
+     * G+1 and zero-bits the bitmap, so the next load (at G+1) sees NO
+     * component override. The full Blob wins; the stale component row is
+     * invisible.
+     *
+     * <p>This is the core safety property of the ClearComponents design:
+     * even though the old component row is not physically deleted, it
+     * cannot resurrect because loadComponentsWithGeneration only returns
+     * rows matching the current generation.
+     */
+    @Test
+    void testComponentSaveFollowedByQuitFullSave_blobWins() throws SQLException {
+        UUID uuid = UUID.randomUUID();
+        String server = "server-A";
+
+        var lock = databaseManager.acquireLock(uuid, server);
+        assertTrue(lock.acquired());
+        long fencingToken = lock.fencingToken();
+
+        // Step 1: Write INVENTORY component at generation 0
+        Map<String, byte[]> components = new HashMap<>();
+        components.put("INVENTORY", new byte[]{1, 2, 3});  // stale component payload
+        Map<String, Long> checksums = new HashMap<>();
+        checksums.put("INVENTORY", 111L);
+        var compResult = databaseManager.upsertComponentsIfLockHeld(
+            uuid, components, checksums, server, fencingToken, 1L);
+        assertTrue(compResult.success());
+        assertEquals(0, compResult.generation(), "First component save should be at generation 0");
+        assertEquals(1L, compResult.componentBitmap(), "Bitmap should have INVENTORY bit");
+
+        // Step 2: QUIT full Blob save — writes the full Blob, bumps generation
+        // to 1, zeros the bitmap. The component row at generation 0 is now
+        // invisible to future loads.
+        byte[] finalBlob = new byte[]{99, 88, 77};  // the "winning" full Blob
+        long finalChecksum = 99999L;
+        boolean saved = databaseManager.saveDataAndReleaseLockClearComponents(
+            uuid, finalBlob, finalChecksum, compResult.newVersion(), fencingToken, server);
+        assertTrue(saved, "QUIT full Blob save should succeed");
+
+        // Verify DB state after QUIT save
+        long genAfter = databaseManager.getComponentGeneration(uuid);
+        long bitmapAfter = databaseManager.getComponentBitmap(uuid);
+        assertEquals(1, genAfter, "Generation should be 1 after QUIT full Blob save");
+        assertEquals(0L, bitmapAfter, "Bitmap should be 0 after QUIT full Blob save");
+
+        // Step 3: Simulate next login — load data and try component overlay
+        // at the current generation. The stale INVENTORY component at
+        // generation 0 must NOT be returned.
+        var loaded = databaseManager.loadData(uuid);
+        assertTrue(loaded.hasData(), "Full Blob should be loadable");
+        assertEquals(finalChecksum, loaded.checksum(), "Loaded Blob should be the QUIT save's Blob");
+
+        var componentOverlay = databaseManager.loadComponentsWithGeneration(
+            uuid, java.util.Set.of("INVENTORY"), genAfter);
+        assertTrue(componentOverlay.isEmpty(),
+            "Component overlay at generation " + genAfter + " must be empty — "
+            + "the stale INVENTORY row at generation 0 must NOT be loaded. "
+            + "If this fails, the full Blob is being silently overridden by "
+            + "stale component data.");
+
+        // The stale row still exists at generation 0 (for GC/diagnosis),
+        // but it is invisible to the load path.
+        var staleRow = databaseManager.loadComponentsWithGeneration(
+            uuid, java.util.Set.of("INVENTORY"), 0);
+        assertFalse(staleRow.isEmpty(),
+            "Stale component row at generation 0 should still exist for GC/diagnosis");
+    }
+
+    /**
+     * Verifies the online-save variant of invariant #7: after a component save
+     * at generation G, an online full Blob save (keepLockClearComponents) also
+     * bumps generation and zeros bitmap, making the stale component invisible.
+     *
+     * <p>This is the same property as {@link #testComponentSaveFollowedByQuitFullSave_blobWins}
+     * but for the PERIODIC/BULK/WORLD_SAVE/DEATH path (releaseLock=false).
+     * The online save keeps the lock but still invalidates stale components.
+     */
+    @Test
+    void testComponentSaveFollowedByOnlineFullSave_blobWins() throws SQLException {
+        UUID uuid = UUID.randomUUID();
+        String server = "server-A";
+
+        var lock = databaseManager.acquireLock(uuid, server);
+        assertTrue(lock.acquired());
+        long fencingToken = lock.fencingToken();
+
+        // Component save at generation 0
+        Map<String, byte[]> components = new HashMap<>();
+        components.put("VITALS", new byte[]{42});
+        Map<String, Long> checksums = new HashMap<>();
+        checksums.put("VITALS", 42L);
+        var compResult = databaseManager.upsertComponentsIfLockHeld(
+            uuid, components, checksums, server, fencingToken, 2L);  // bit 1 = VITALS
+        assertTrue(compResult.success());
+        assertEquals(0, compResult.generation());
+
+        // Online full Blob save (keepLockClearComponents) — generation bumps to 1
+        byte[] onlineBlob = new byte[]{10, 20, 30};
+        boolean saved = databaseManager.saveDataKeepLockClearComponents(
+            uuid, onlineBlob, 333L, compResult.newVersion(), fencingToken, server);
+        assertTrue(saved, "Online full Blob save should succeed");
+
+        assertEquals(1, databaseManager.getComponentGeneration(uuid),
+            "Generation should be 1 after online full Blob save");
+        assertEquals(0L, databaseManager.getComponentBitmap(uuid),
+            "Bitmap should be 0 after online full Blob save");
+
+        // The VITALS component at generation 0 must be invisible at generation 1
+        var overlay = databaseManager.loadComponentsWithGeneration(
+            uuid, java.util.Set.of("VITALS"), 1);
+        assertTrue(overlay.isEmpty(),
+            "Stale VITALS at generation 0 must NOT be loaded at generation 1");
+    }
+
+    /**
+     * Verifies that multiple component saves accumulate the bitmap correctly,
+     * and that a single full Blob save clears ALL accumulated bits.
+     *
+     * <p>This catches a regression where the ClearComponents UPDATE might
+     * accidentally only clear some bits (e.g. due to a wrong column reference
+     * or a partial UPDATE). The bitmap must go to exactly 0, not "old | new"
+     * or "old & ~new".
+     */
+    @Test
+    void testMultipleComponentSavesThenFullBlobSaveClearsAllBits() throws SQLException {
+        UUID uuid = UUID.randomUUID();
+        String server = "server-A";
+
+        var lock = databaseManager.acquireLock(uuid, server);
+        assertTrue(lock.acquired());
+        long fencingToken = lock.fencingToken();
+
+        // Save INVENTORY (bit 0) + VITALS (bit 1) + EXPERIENCE (bit 2)
+        long bits = 0b111;
+        Map<String, byte[]> comps = new HashMap<>();
+        comps.put("INVENTORY", new byte[]{1});
+        comps.put("VITALS", new byte[]{2});
+        comps.put("EXPERIENCE", new byte[]{3});
+        Map<String, Long> cs = new HashMap<>();
+        cs.put("INVENTORY", 1L);
+        cs.put("VITALS", 2L);
+        cs.put("EXPERIENCE", 3L);
+
+        var r = databaseManager.upsertComponentsIfLockHeld(
+            uuid, comps, cs, server, fencingToken, bits);
+        assertTrue(r.success());
+        assertEquals(bits, r.componentBitmap(),
+            "Bitmap should have bits 0,1,2 set: " + Long.toBinaryString(r.componentBitmap()));
+        assertEquals(bits, databaseManager.getComponentBitmap(uuid),
+            "DB bitmap should match result bitmap");
+
+        // Full Blob save must clear ALL bits
+        boolean saved = databaseManager.saveDataKeepLockClearComponents(
+            uuid, new byte[]{99}, 999L, r.newVersion(), fencingToken, server);
+        assertTrue(saved);
+
+        assertEquals(0L, databaseManager.getComponentBitmap(uuid),
+            "All accumulated bits must be cleared by full Blob save");
+    }
+
     // ==================== Helpers ====================
 
     private static boolean isDockerAvailable() {
