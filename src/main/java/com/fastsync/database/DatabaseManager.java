@@ -518,15 +518,16 @@ public class DatabaseManager {
      */
     public LockResult acquireLock(UUID uuid, String serverName, String lockSessionId) throws SQLException {
         requireLockSession(lockSessionId, "acquireLock");
-        // Use DB server time for lock expiry calculation, NOT JVM local time.
-        // This eliminates clock-skew issues between Paper/Folia nodes: if node A's
-        // clock is ahead, it won't prematurely consider node B's lock expired.
-        // The extra SELECT is one round-trip but only on the login path (not hot).
-        long now;
-        try (Connection timeConn = dataSource.getConnection()) {
-            now = getDatabaseTimeMs(timeConn);
-        }
-        long expiredTime = now - (config.getLockTimeout() * 1000L);
+        // Performance: inline UNIX_TIMESTAMP() into the SQL instead of a
+        // separate SELECT round-trip. This saves one DB round-trip on the
+        // login path (critical under login storms). The lock-timeout is
+        // passed as a bind parameter and subtracted inline to compute
+        // expiredTime = now - (lockTimeout * 1000).
+        //
+        // Clock-safety is preserved: all time comparisons use the MySQL
+        // server clock, not JVM local time, eliminating clock-skew issues
+        // between Paper/Folia nodes.
+        long lockTimeoutMs = config.getLockTimeout() * 1000L;
 
         // INSERT ... ON DUPLICATE KEY UPDATE merges row creation and conditional
         // lock acquisition into one statement. The INSERT arm seeds a new player
@@ -553,12 +554,6 @@ public class DatabaseManager {
         // retry and proceeds immediately. (b) is the safety net for crashes.
         //
         // P0 SAFETY CHECK (round 10): lock_session_id — per-acquire nonce.
-        //
-        // The round-9 attempt to use locked_at == now broke CI (jOOQ Long
-        // retrieval vs primitive long comparison subtlety). The round-8
-        // removal of `OR locked_by = ?` was insufficient on its own because
-        // the read-back only checked locked_by, which a prior same-serverName
-        // session had already set.
         //
         // The robust fix: write a per-acquire nonce (lock_session_id) to a
         // new column. The read-back requires BOTH locked_by == serverName
@@ -597,21 +592,26 @@ public class DatabaseManager {
         // release, and acquireLock sets it to `now` while held. No reliance
         // on locked_by here, so the same-serverName quick-reconnect guard
         // continues to come from the read-back's lock_session_id check.
+        //
+        // The `now` and `expiredTime` values are computed inline via
+        // (SELECT UNIX_TIMESTAMP() * 1000) so we never need a separate
+        // time-query round-trip. The same subquery appears multiple times —
+        // MySQL optimizes repeated scalar subqueries within a statement.
         String sql = String.format("""
             INSERT INTO `%s` (cluster_id, uuid, data, version, checksum, fencing_token, locked_by, locked_at, lock_session_id, last_server, last_updated)
-            VALUES (?, ?, '', 0, 0, 1, ?, ?, ?, NULL, 0)
+            VALUES (?, ?, '', 0, 0, 1, ?, (SELECT UNIX_TIMESTAMP() * 1000), ?, NULL, 0)
             ON DUPLICATE KEY UPDATE
-                fencing_token = IF(locked_at IS NULL OR locked_at < ?,
+                fencing_token = IF(locked_at IS NULL OR locked_at < ((SELECT UNIX_TIMESTAMP() * 1000) - ?),
                                    LAST_INSERT_ID(fencing_token + 1),
                                    fencing_token),
-                locked_by = IF(locked_at IS NULL OR locked_at < ?,
+                locked_by = IF(locked_at IS NULL OR locked_at < ((SELECT UNIX_TIMESTAMP() * 1000) - ?),
                                ?,
                                locked_by),
-                lock_session_id = IF(locked_at IS NULL OR locked_at < ?,
+                lock_session_id = IF(locked_at IS NULL OR locked_at < ((SELECT UNIX_TIMESTAMP() * 1000) - ?),
                                       ?,
                                       lock_session_id),
-                locked_at = IF(locked_at IS NULL OR locked_at < ?,
-                               ?,
+                locked_at = IF(locked_at IS NULL OR locked_at < ((SELECT UNIX_TIMESTAMP() * 1000) - ?),
+                               (SELECT UNIX_TIMESTAMP() * 1000),
                                locked_at)
             """, dataTable);
 
@@ -622,15 +622,13 @@ public class DatabaseManager {
                 clusterId,        // INSERT: cluster_id
                 uuid.toString(),  // INSERT: uuid
                 serverName,       // INSERT: locked_by
-                now,              // INSERT: locked_at
                 lockSessionId,    // INSERT: lock_session_id
-                expiredTime,      // fencing_token IF predicate
-                expiredTime,      // locked_by IF predicate
+                lockTimeoutMs,    // fencing_token IF predicate (expiredTime = now - lockTimeoutMs)
+                lockTimeoutMs,    // locked_by IF predicate
                 serverName,       // locked_by new value
-                expiredTime,      // lock_session_id IF predicate
+                lockTimeoutMs,    // lock_session_id IF predicate
                 lockSessionId,    // lock_session_id new value
-                expiredTime,      // locked_at IF predicate
-                now               // locked_at new value
+                lockTimeoutMs     // locked_at IF predicate
             );
 
             // Read back fencing_token, locked_by, AND lock_session_id using

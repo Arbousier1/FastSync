@@ -250,6 +250,11 @@ public class SyncManager {
     // re-iterating Bukkit.advancementIterator()/Attribute.values() on every save.
     private volatile org.bukkit.advancement.Advancement[] cachedAdvancements;
     private volatile Attribute[] cachedAttributes;
+    // Performance: cache EquipmentSlotGroup → UTF-8 bytes. These are singleton
+    // constants (ANY, HAND, ARMOR, etc.) so toString()/getBytes() results never
+    // change. Caching avoids ~N allocations per modifier per save.
+    private static final java.util.Map<org.bukkit.inventory.EquipmentSlotGroup, byte[]>
+        SLOT_GROUP_BYTES_CACHE = java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
 
     // P0 (issue #63): Attribute.MAX_HEALTH is a deprecated legacy field on
     // Paper 1.21+ (Attribute is no longer an enum). Resolve once via the
@@ -908,8 +913,12 @@ public class SyncManager {
                 player.getEnderChest().clear();
             }
             if (config.isSyncPotionEffects()) {
-                for (PotionEffect effect : new ArrayList<>(player.getActivePotionEffects())) {
-                    player.removePotionEffect(effect.getType());
+                // Avoid allocating an ArrayList copy when there are no effects.
+                java.util.Collection<PotionEffect> active = player.getActivePotionEffects();
+                if (!active.isEmpty()) {
+                    for (PotionEffect effect : active) {
+                        player.removePotionEffect(effect.getType());
+                    }
                 }
             }
         }
@@ -1565,20 +1574,21 @@ public class SyncManager {
             data.setFencingToken(fencingToken);
         }
 
-        // Inventory - normalize empty/AIR slots to null so the serializer can treat
-        // them uniformly and avoid storing meaningless AIR ItemStacks (sparse storage).
+        // Inventory — pass the raw array directly; ItemStackCompat.serialize()
+        // already treats null and AIR as empty (returns byte[0]), so the
+        // sparseContents() copy is unnecessary and just wastes allocation.
         // All basic fields are now gated by config checks — disabling sync items
         // genuinely reduces serialization cost, NBT size, and DB write size.
         if (config.isSyncInventory()) {
-            data.setInventory(sparseContents(player.getInventory().getContents()));
-            data.setArmor(sparseContents(player.getInventory().getArmorContents()));
+            data.setInventory(player.getInventory().getContents());
+            data.setArmor(player.getInventory().getArmorContents());
             org.bukkit.inventory.ItemStack offhand = player.getInventory().getItemInOffHand();
-            data.setOffhand(offhand != null && offhand.getType() == org.bukkit.Material.AIR ? null : offhand);
+            data.setOffhand(offhand != null && offhand.getType().isAir() ? null : offhand);
         }
 
         // Ender chest
         if (config.isSyncEnderChest()) {
-            data.setEnderChest(sparseContents(player.getEnderChest().getContents()));
+            data.setEnderChest(player.getEnderChest().getContents());
         }
 
         // Vitals
@@ -1865,26 +1875,29 @@ public class SyncManager {
 
                     String key = attr.getKey().toString();
                     double baseValue = instance.getBaseValue();
-                    List<PlayerData.ModifierData> modifiers = new ArrayList<>();
+                    java.util.Collection<AttributeModifier> mods = instance.getModifiers();
+                    // Avoid allocating an ArrayList when there are no modifiers.
+                    List<PlayerData.ModifierData> modifiers =
+                        mods.isEmpty() ? java.util.Collections.emptyList() : new ArrayList<>(mods.size());
 
-                    for (AttributeModifier mod : instance.getModifiers()) {
+                    for (AttributeModifier mod : mods) {
                         // P0 (issue #56): capture the EquipmentSlotGroup so slot-
                         // restricted modifiers (e.g. helmet-only +max_health) round-
                         // trip correctly. Without this, the apply path falls back to
                         // the 4-arg constructor which defaults the slot to ANY,
                         // making slot-restricted buffs apply globally.
-                        String slotGroupName = null;
+                        byte[] slotBytes = null;
                         try {
                             org.bukkit.inventory.EquipmentSlotGroup group = mod.getSlotGroup();
                             if (group != null) {
-                                slotGroupName = group.toString();
+                                // Performance: cache the UTF-8 bytes — slot groups
+                                // are singleton constants so the result never changes.
+                                slotBytes = SLOT_GROUP_BYTES_CACHE.computeIfAbsent(group,
+                                    g -> g.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
                             }
                         } catch (NoSuchMethodError | Exception ignored) {
                             // Pre-1.21 API does not have getSlotGroup — leave null.
                         }
-                        byte[] slotBytes = slotGroupName != null
-                            ? slotGroupName.getBytes(java.nio.charset.StandardCharsets.UTF_8)
-                            : null;
                         modifiers.add(new PlayerData.ModifierData(
                             mod.getKey().toString(),
                             mod.getName(),
@@ -3992,31 +4005,6 @@ public class SyncManager {
     }
 
     /**
-     * Normalize an ItemStack[] so empty/AIR slots become null. The array length
-     * (and thus slot positions) is preserved; only AIR entries are cleared. This
-     * lets the serializer treat empty slots uniformly as null instead of storing
-     * meaningless AIR ItemStacks.
-     *
-     * <p>P2 (issue #71): returns a defensive copy rather than mutating the input
-     * array. Previously relied on Bukkit {@code PlayerInventory.getContents()}
-     * returning a fresh copy — verified true on CraftBukkit 1.21.11, but a
-     * future Paper version could change that contract. The defensive copy is
-     * 36 elements (inventory) or 27 (ender chest) — negligible cost.
-     */
-    private org.bukkit.inventory.ItemStack[] sparseContents(org.bukkit.inventory.ItemStack[] contents) {
-        if (contents == null) return null;
-        org.bukkit.inventory.ItemStack[] copy = new org.bukkit.inventory.ItemStack[contents.length];
-        for (int i = 0; i < contents.length; i++) {
-            if (contents[i] != null && contents[i].getType() == org.bukkit.Material.AIR) {
-                copy[i] = null;
-            } else {
-                copy[i] = contents[i];
-            }
-        }
-        return copy;
-    }
-
-    /**
      * Apply the saved inventory contents to the player with full-replace semantics
      * (matching MC {@code Inventory.load}).
      *
@@ -4034,10 +4022,21 @@ public class SyncManager {
      */
     private void setInventoryContents(Player player, org.bukkit.inventory.ItemStack[] contents) {
         if (contents == null) return;
+        // Performance: use setStorageContents for bulk write instead of per-slot
+        // setItem() calls. This reduces N inventory-update events to a single
+        // batch update, cutting apply latency significantly on login.
+        // Full-replace semantics (P0 issue #57) are preserved: if the saved
+        // array is shorter than the inventory, we pad with nulls first.
         org.bukkit.inventory.ItemStack[] current = player.getInventory().getContents();
-        int max = current.length;
-        for (int i = 0; i < max; i++) {
-            player.getInventory().setItem(i, i < contents.length ? contents[i] : null);
+        if (contents.length >= current.length) {
+            // Saved array covers all slots — direct bulk write.
+            player.getInventory().setStorageContents(contents);
+        } else {
+            // Saved array is shorter — pad to full length to clear trailing slots.
+            org.bukkit.inventory.ItemStack[] padded = new org.bukkit.inventory.ItemStack[current.length];
+            System.arraycopy(contents, 0, padded, 0, contents.length);
+            // Remaining slots default to null (full-replace semantics).
+            player.getInventory().setStorageContents(padded);
         }
     }
 
@@ -4047,10 +4046,14 @@ public class SyncManager {
      */
     private void setEnderChestContents(Player player, org.bukkit.inventory.ItemStack[] contents) {
         if (contents == null) return;
+        // Performance: use setStorageContents for bulk write (see setInventoryContents).
         org.bukkit.inventory.ItemStack[] current = player.getEnderChest().getContents();
-        int max = current.length;
-        for (int i = 0; i < max; i++) {
-            player.getEnderChest().setItem(i, i < contents.length ? contents[i] : null);
+        if (contents.length >= current.length) {
+            player.getEnderChest().setStorageContents(contents);
+        } else {
+            org.bukkit.inventory.ItemStack[] padded = new org.bukkit.inventory.ItemStack[current.length];
+            System.arraycopy(contents, 0, padded, 0, contents.length);
+            player.getEnderChest().setStorageContents(padded);
         }
     }
 
