@@ -319,26 +319,10 @@ public class SyncManager {
      * Initialize the sync manager with async executor and optional Redis.
      */
     public void initialize() {
-        // Create dedicated thread pool (NOT ForkJoinPool.commonPool).
-        // Pool size: half of config poolSize (the other half is reserved for
-        // Redis/heartbeat/cleanup tasks). Queue capacity: from config
-        // database.queue-capacity (default 256). Bounded queue is CRITICAL —
-        // see AsyncExecutor javadoc for why an unbounded queue would let
-        // tasks pile up under DB latency / login storms and exhaust heap.
-        int poolSize = Math.max(2, config.getPoolSize() / 2);
-        int queueCapacity = Math.max(1, config.getQueueCapacity());
-        asyncExecutor = new AsyncExecutor(logger, "FastSync-Async", poolSize, queueCapacity);
-
-        // Round 16 (P0 #3): dedicated final-save executor. 2 threads so a
-        // stuck save on one thread does not head-of-line block the next QUIT
-        // save; queue is 4x the main queue so QUIT saves rarely fall back to
-        // synchronous execution on the event thread.
-        // Round 14: final-save executor uses configurable threads + queue capacity.
-        int finalThreads = Math.max(2, config.getFinalSaveThreads());
-        int finalQueue = Math.max(1024, config.getFinalSaveQueueCapacity());
-        finalSaveExecutor = new AsyncExecutor(logger, "FastSync-FinalSave", finalThreads, finalQueue);
-
-        // Initialize final-save spool (WAL for queue-full events)
+        // Initialize final-save spool FIRST — in production mode, failure to
+        // initialize the spool is a hard error (data loss on queue-full).
+        // This must happen before executor creation so that a spool init
+        // failure leaves executors null (no partial init).
         if (config.isFinalSaveSpoolEnabled()) {
             try {
                 java.nio.file.Path spoolDir = plugin.getDataFolder().toPath()
@@ -358,10 +342,33 @@ public class SyncManager {
                     finalSaveReplayService.start();
                 }
             } catch (Exception e) {
+                if (config.isProductionEnabled()) {
+                    throw new IllegalStateException(
+                        "Refusing to start: final-save spool could not be initialized in production mode", e);
+                }
                 logger.log(Level.SEVERE, "Failed to initialize final-save spool! "
                     + "Queue-full events will result in data loss.", e);
             }
         }
+
+        // Create dedicated thread pool (NOT ForkJoinPool.commonPool).
+        // Pool size: half of config poolSize (the other half is reserved for
+        // Redis/heartbeat/cleanup tasks). Queue capacity: from config
+        // database.queue-capacity (default 256). Bounded queue is CRITICAL —
+        // see AsyncExecutor javadoc for why an unbounded queue would let
+        // tasks pile up under DB latency / login storms and exhaust heap.
+        int poolSize = Math.max(2, config.getPoolSize() / 2);
+        int queueCapacity = Math.max(1, config.getQueueCapacity());
+        asyncExecutor = new AsyncExecutor(logger, "FastSync-Async", poolSize, queueCapacity);
+
+        // Round 16 (P0 #3): dedicated final-save executor. 2 threads so a
+        // stuck save on one thread does not head-of-line block the next QUIT
+        // save; queue is 4x the main queue so QUIT saves rarely fall back to
+        // synchronous execution on the event thread.
+        // Round 14: final-save executor uses configurable threads + queue capacity.
+        int finalThreads = Math.max(2, config.getFinalSaveThreads());
+        int finalQueue = Math.max(1024, config.getFinalSaveQueueCapacity());
+        finalSaveExecutor = new AsyncExecutor(logger, "FastSync-FinalSave", finalThreads, finalQueue);
 
         // Login backpressure semaphore — limits concurrent pre-login loads
         loginLoadSemaphore = new java.util.concurrent.Semaphore(config.getMaxConcurrentLoads(), true);
@@ -2736,6 +2743,29 @@ public class SyncManager {
      * — a timeout, not an ordering. Clock skew may cause cleanup to happen slightly
      * early or late, but cannot cause data corruption.
      */
+
+    /**
+     * Determine whether a SQLException represents a connection-level failure
+     * (as opposed to a statement-level error like a syntax error or deadlock).
+     *
+     * <p>SQLState class 08xxx covers connection exceptions as defined by the
+     * SQL standard. When the connection itself is broken, per-player fallback
+     * refreshes will also fail — so the caller can skip them and go straight
+     * to failure counting.
+     *
+     * @param e the SQLException to classify
+     * @return true if this is a connection-level failure
+     */
+    public static boolean isConnectionFailure(SQLException e) {
+        if (e == null) return false;
+        // SQLTransientConnectionException is the JDBC mapping for SQLState
+        // class 08 (connection exception), but its constructors do not always
+        // populate the SQLState field — so check the type as well.
+        if (e instanceof java.sql.SQLTransientConnectionException) return true;
+        String sqlState = e.getSQLState();
+        return sqlState != null && sqlState.startsWith("08");
+    }
+
     /**
      * Heartbeat: refresh locked_at for all online players whose locks we hold.
      *
@@ -2803,16 +2833,24 @@ public class SyncManager {
                 databaseManager.refreshLockBatch(playersToRefresh, playerLockSessions, serverName, failedPlayers);
             } catch (SQLException e) {
                 batchFailed = true;
-                logger.log(Level.WARNING, "[Heartbeat] Batch refresh failed; falling back to per-player", e);
-                // Fallback: per-player refresh
-                for (java.util.Map.Entry<UUID, Long> entry : playersToRefresh.entrySet()) {
-                    try {
-                        if (!databaseManager.refreshLock(entry.getKey(), serverName, entry.getValue(), playerLockSessions.get(entry.getKey()))) {
+                if (isConnectionFailure(e)) {
+                    // Connection-level failure — per-player refresh will also fail.
+                    // Skip the fallback to avoid N pointless round-trips and go
+                    // straight to failure counting.
+                    logger.log(Level.WARNING, "[Heartbeat] Batch refresh failed with connection error; skipping per-player fallback", e);
+                    failedPlayers.addAll(playersToRefresh.keySet());
+                } else {
+                    logger.log(Level.WARNING, "[Heartbeat] Batch refresh failed; falling back to per-player", e);
+                    // Fallback: per-player refresh
+                    for (java.util.Map.Entry<UUID, Long> entry : playersToRefresh.entrySet()) {
+                        try {
+                            if (!databaseManager.refreshLock(entry.getKey(), serverName, entry.getValue(), playerLockSessions.get(entry.getKey()))) {
+                                failedPlayers.add(entry.getKey());
+                            }
+                        } catch (SQLException ex) {
+                            logger.log(Level.WARNING, "[Heartbeat] Per-player refresh failed for " + entry.getKey(), ex);
                             failedPlayers.add(entry.getKey());
                         }
-                    } catch (SQLException ex) {
-                        logger.log(Level.WARNING, "[Heartbeat] Per-player refresh failed for " + entry.getKey(), ex);
-                        failedPlayers.add(entry.getKey());
                     }
                 }
             }
@@ -3194,6 +3232,32 @@ public class SyncManager {
                 default -> false;
             };
         }
+    }
+
+    /**
+     * Classify an exception thrown during a save operation into a
+     * {@link SaveFailureReason}.
+     *
+     * <ul>
+     *   <li>{@link SaveFailureReason#DB_UNAVAILABLE} — SQLException (possibly
+     *       wrapped in a RuntimeException)</li>
+     *   <li>{@link SaveFailureReason#SERIALIZATION_ERROR} — IOException
+     *       (encoding/compression failure)</li>
+     *   <li>{@link SaveFailureReason#UNKNOWN} — anything else</li>
+     * </ul>
+     *
+     * @param e the exception to classify
+     * @return the appropriate SaveFailureReason
+     */
+    public static SaveFailureReason classifySaveException(Exception e) {
+        if (e == null) return SaveFailureReason.UNKNOWN;
+        Throwable cause = e;
+        while (cause != null) {
+            if (cause instanceof SQLException) return SaveFailureReason.DB_UNAVAILABLE;
+            if (cause instanceof IOException) return SaveFailureReason.SERIALIZATION_ERROR;
+            cause = cause.getCause();
+        }
+        return SaveFailureReason.UNKNOWN;
     }
 
     /**
@@ -4258,6 +4322,52 @@ public class SyncManager {
     }
     public String getFinalSaveSpoolLastError() {
         return finalSaveSpool != null ? finalSaveSpool.getLastError() : null;
+    }
+
+    /**
+     * Spool a failed final save for later replay.
+     *
+     * <p>Only retryable failures ({@link SaveResult#isRetryable()}) are spooled.
+     * Non-retryable failures (FENCING_MISMATCH, VERSION_CONFLICT) are NOT spooled
+     * — the lock is lost and replaying the save would clobber newer data.
+     *
+     * @param uuid the player UUID
+     * @param data the player data that failed to save
+     * @param kind the save kind (typically QUIT)
+     * @param result the failed save result
+     * @param lockSessionId the lock session ID
+     * @param detail a human-readable description of the failure
+     * @return true if the save was spooled, false if it was not retryable or spooling failed
+     */
+    public boolean spoolRetryableFinalSave(
+            UUID uuid, PlayerData data, SaveKind kind,
+            SaveResult result, String lockSessionId, String detail) {
+        if (!result.isRetryable()) {
+            return false;
+        }
+        if (finalSaveSpool == null) {
+            logger.warning("[FinalSave] Cannot spool retryable save for " + uuid
+                + " — spool is not initialized: " + detail);
+            return false;
+        }
+        try {
+            com.fastsync.spool.EncodedFinalSave encoded = com.fastsync.spool.FinalSaveEncoder.encode(
+                uuid, data, kind,
+                config.getClusterId(), config.getServerName(),
+                lockSessionId, config.getCompressionMinSize());
+            finalSaveSpool.append(encoded);
+            finalSaveSpoolEnqueuedTotal.incrementAndGet();
+            finalSaveLastSpoolEnqueuedAt.set(System.currentTimeMillis());
+            logger.info("[FinalSave] Spooled retryable " + kind + " save for " + uuid
+                + " (" + result.failureReason() + "): " + detail);
+            return true;
+        } catch (Exception e) {
+            finalSaveSpoolRejectedTotal.incrementAndGet();
+            finalSaveLastSpoolRejectedAt.set(System.currentTimeMillis());
+            logger.log(Level.SEVERE, "[FinalSave] CRITICAL: failed to spool retryable save for "
+                + uuid + ". Final state may be lost. Lock will expire naturally.", e);
+            return false;
+        }
     }
 
     public boolean isOperationLogEnabled() {
