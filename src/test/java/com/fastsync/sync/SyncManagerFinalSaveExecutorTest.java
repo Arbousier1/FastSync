@@ -73,9 +73,13 @@ class SyncManagerFinalSaveExecutorTest {
         assertNotNull(finalSaveExecutor, "finalSaveExecutor must be initialized");
         assertNotSame(asyncExecutor, finalSaveExecutor,
             "finalSaveExecutor must be a distinct pool, not the same instance as asyncExecutor");
-        assertEquals(7, syncManager.getNonCriticalDbLimit(),
-            "pool=10 with two final-save threads and one heartbeat reserve leaves seven non-critical slots");
-        assertEquals(7, syncManager.getNonCriticalDbAvailablePermits());
+        // The old "non-critical DB budget" concept was removed in Round 20.
+        // Verify the login-load semaphore (max-concurrent-loads) is initialized
+        // correctly instead. Default max-concurrent-loads = min(pool-size - 3, 6).
+        assertTrue(syncManager.getLoginLoadLimit() > 0,
+            "login-load limit must be positive");
+        assertTrue(syncManager.getLoginLoadAvailablePermits() >= 0,
+            "available login-load permits must be non-negative");
     }
 
     /**

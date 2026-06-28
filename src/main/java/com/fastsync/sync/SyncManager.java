@@ -1593,7 +1593,10 @@ public class SyncManager {
 
         // Vitals
         if (config.isSyncHealth()) {
-            double maxHealth = player.getMaxHealth();
+            // Use Attribute API (not deprecated getMaxHealth()) to get max health.
+            Attribute resolvedAttr = loadMaxHealthAttribute();
+            AttributeInstance maxHealthAttr = resolvedAttr != null ? player.getAttribute(resolvedAttr) : null;
+            double maxHealth = maxHealthAttr != null ? maxHealthAttr.getBaseValue() : player.getMaxHealth();
             double currentHealth = player.getHealth();
             // P1 (issue #60): when a player is dead (health <= 0) at collect
             // time — e.g. they died and immediately quit before respawn —
@@ -1613,9 +1616,7 @@ public class SyncManager {
             // returns false (e.g. plugin-managed fake death).
             boolean dead = player.isDead() || currentHealth <= 0;
             data.setHealth(dead ? maxHealth : currentHealth);
-            Attribute resolvedAttr = loadMaxHealthAttribute();
-            AttributeInstance maxHealthAttr = resolvedAttr != null ? player.getAttribute(resolvedAttr) : null;
-            data.setMaxHealth(maxHealthAttr != null ? maxHealthAttr.getBaseValue() : maxHealth);
+            data.setMaxHealth(maxHealth);
         }
         if (config.isSyncFood()) {
             data.setFoodLevel(player.getFoodLevel());
@@ -4090,6 +4091,16 @@ public class SyncManager {
 
     public int getPendingCount() {
         return pendingData.size() + pendingEmptyData.size();
+    }
+
+    /** Available permits on the login-load semaphore (max-concurrent-loads). */
+    public int getLoginLoadAvailablePermits() {
+        return loginLoadSemaphore != null ? loginLoadSemaphore.availablePermits() : 0;
+    }
+
+    /** Max permits on the login-load semaphore (max-concurrent-loads). */
+    public int getLoginLoadLimit() {
+        return loginLoadSemaphore != null ? config.getMaxConcurrentLoads() : 0;
     }
 
     public int getActiveCount() {
