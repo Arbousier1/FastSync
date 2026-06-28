@@ -304,12 +304,13 @@ public class SnapshotManager {
     public CompletableFuture<byte[]> loadSnapshot(long snapshotId) {
         return supplySnapshotAsync(() -> {
             String sql = String.format("""
-                SELECT data FROM `%s` WHERE id = ?
+                SELECT data FROM `%s` WHERE cluster_id = ? AND id = ?
                 """, snapshotTable);
 
             try (Connection conn = getDataSource().getConnection();
                  PreparedStatement ps = conn.prepareStatement(sql)) {
-                ps.setLong(1, snapshotId);
+                ps.setString(1, databaseManager.getClusterId());
+                ps.setLong(2, snapshotId);
                 try (ResultSet rs = ps.executeQuery()) {
                     if (rs.next()) {
                         return rs.getBytes("data");
@@ -332,12 +333,13 @@ public class SnapshotManager {
     public CompletableFuture<Void> deleteSnapshot(long snapshotId) {
         return supplySnapshotAsync(() -> {
             String sql = String.format("""
-                DELETE FROM `%s` WHERE id = ?
+                DELETE FROM `%s` WHERE cluster_id = ? AND id = ?
                 """, snapshotTable);
 
             try (Connection conn = getDataSource().getConnection();
                  PreparedStatement ps = conn.prepareStatement(sql)) {
-                ps.setLong(1, snapshotId);
+                ps.setString(1, databaseManager.getClusterId());
+                ps.setLong(2, snapshotId);
                 int affected = ps.executeUpdate();
                 if (config.isDebug()) {
                     logger.info("Deleted snapshot " + snapshotId + " (affected=" + affected + ")");
@@ -361,16 +363,18 @@ public class SnapshotManager {
     public CompletableFuture<Void> pinSnapshot(long snapshotId, boolean pinned) {
         return supplySnapshotAsync(() -> {
             String sql = String.format("""
-                UPDATE `%s` SET pinned = ? WHERE id = ?
+                UPDATE `%s` SET pinned = ? WHERE cluster_id = ? AND id = ?
                 """, snapshotTable);
 
             try (Connection conn = getDataSource().getConnection();
                  PreparedStatement ps = conn.prepareStatement(sql)) {
                 ps.setBoolean(1, pinned);
-                ps.setLong(2, snapshotId);
-                ps.executeUpdate();
+                ps.setString(2, databaseManager.getClusterId());
+                ps.setLong(3, snapshotId);
+                int affected = ps.executeUpdate();
                 if (config.isDebug()) {
-                    logger.info("Snapshot " + snapshotId + " pinned=" + pinned);
+                    logger.info("Snapshot " + snapshotId + " pinned=" + pinned
+                        + " (affected=" + affected + ")");
                 }
             } catch (SQLException e) {
                 logger.log(Level.SEVERE, "Failed to update pin state for snapshot " + snapshotId, e);
@@ -451,12 +455,13 @@ public class SnapshotManager {
         }
 
         String sql = String.format("""
-            DELETE FROM `%s` WHERE id IN (%s)
+            DELETE FROM `%s` WHERE cluster_id = ? AND id IN (%s)
             """, snapshotTable, placeholders);
 
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, databaseManager.getClusterId());
             for (int i = 0; i < ids.size(); i++) {
-                ps.setLong(i + 1, ids.get(i));
+                ps.setLong(i + 2, ids.get(i));
             }
             ps.executeUpdate();
         }

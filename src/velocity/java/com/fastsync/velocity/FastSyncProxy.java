@@ -91,7 +91,12 @@ public class FastSyncProxy {
         proxy.getChannelRegistrar().register(HANDOFF_CHANNEL);
 
         // Register /fastsync command
-        proxy.getCommandManager().register("fastsync", new FastSyncCommand(), "fsync", "fs");
+        var commandManager = proxy.getCommandManager();
+        var commandMeta = commandManager.metaBuilder("fastsync")
+            .aliases("fsync", "fs")
+            .plugin(this)
+            .build();
+        commandManager.register(commandMeta, new FastSyncCommand());
 
         // Start periodic status log (every 5 min)
         proxy.getScheduler().buildTask(this, this::logStatus)
@@ -230,7 +235,7 @@ public class FastSyncProxy {
         }
 
         return CompletableFuture
-            .allOf(futures.toArray(new CompletableFuture[0]))
+            .allOf(futures.toArray(new CompletableFuture<?>[0]))
             .thenApply(v -> {
                 List<HandoffProtocol.StatusResponseData> results = new ArrayList<>();
                 for (CompletableFuture<HandoffProtocol.StatusResponseData> f : futures) {

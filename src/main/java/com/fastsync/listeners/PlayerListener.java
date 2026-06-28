@@ -2,7 +2,7 @@ package com.fastsync.listeners;
 
 import com.fastsync.FastSync;
 import com.fastsync.sync.SyncManager;
-import org.bukkit.ChatColor;
+import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
@@ -20,6 +20,9 @@ import java.util.UUID;
  * is loaded after the player has already entered the server.
  */
 public class PlayerListener implements Listener {
+
+    private static final LegacyComponentSerializer KICK_MESSAGE_SERIALIZER =
+        LegacyComponentSerializer.legacyAmpersand();
 
     private final FastSync plugin;
     private final SyncManager syncManager;
@@ -62,7 +65,7 @@ public class PlayerListener implements Listener {
             }
             event.disallow(
                 AsyncPlayerPreLoginEvent.Result.KICK_OTHER,
-                ChatColor.translateAlternateColorCodes('&', msg)
+                KICK_MESSAGE_SERIALIZER.deserialize(msg)
             );
         }
     }

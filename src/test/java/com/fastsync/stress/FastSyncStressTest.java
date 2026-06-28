@@ -193,7 +193,7 @@ class FastSyncStressTest {
             ready.await(60, TimeUnit.SECONDS);
             long wallStart = System.nanoTime();
             start.countDown();
-            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(120, TimeUnit.SECONDS);
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture<?>[0])).get(120, TimeUnit.SECONDS);
             long wallElapsed = System.nanoTime() - wallStart;
 
             // Report

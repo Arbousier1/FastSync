@@ -4,7 +4,7 @@ import com.fastsync.FastSync;
 import com.fastsync.config.ConfigManager;
 import com.fastsync.database.DatabaseManager;
 import com.fastsync.sync.SyncManager;
-import org.bukkit.Bukkit;
+import com.fastsync.util.SchedulerUtil;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.messaging.PluginMessageListener;
 import org.jetbrains.annotations.NotNull;
@@ -82,29 +82,26 @@ public class HandoffMessageListener implements PluginMessageListener {
         UUID uuid = UUID.fromString(in.readUTF());
         String newServer = in.readUTF();
 
-        // Check if we (this server) still hold the lock for this player
-        boolean locked = false;
-        try {
-            String lockHolder = database.getLockHolder(uuid);
-            String ourName = config.getServerName();
-            locked = ourName.equals(lockHolder);
-        } catch (Exception e) {
-            logger.log(Level.WARNING, "Failed to check lock holder for " + uuid, e);
-        }
+        // Database I/O must not block the plugin-message/entity thread.
+        SchedulerUtil.runAsync(plugin, () -> {
+            boolean locked = false;
+            try {
+                String lockHolder = database.getLockHolder(uuid);
+                locked = config.getServerName().equals(lockHolder);
+            } catch (Exception e) {
+                logger.log(Level.WARNING, "Failed to check lock holder for " + uuid, e);
+            }
 
-        // Build LOCK_STATUS response
-        byte[] response = encodeLockStatus(uuid, locked, config.getServerName());
+            byte[] response = encodeLockStatus(uuid, locked, config.getServerName());
+            SchedulerUtil.runAtEntity(plugin, proxyPlayer,
+                () -> proxyPlayer.sendPluginMessage(plugin, CHANNEL, response),
+                () -> logger.fine("[Handoff] Carrier player retired before LOCK_STATUS response for " + uuid));
 
-        // Send response back to the proxy (via any online player connection)
-        // In practice, the player who triggered this message is the one switching
-        if (proxyPlayer.isOnline()) {
-            proxyPlayer.sendPluginMessage(plugin, CHANNEL, response);
-        }
-
-        if (config.isDebug()) {
-            logger.info("[Handoff] QUERY_LOCK for " + uuid + " → locked=" + locked +
-                " (newServer=" + newServer + ")");
-        }
+            if (config.isDebug()) {
+                logger.info("[Handoff] QUERY_LOCK for " + uuid + " → locked=" + locked
+                    + " (newServer=" + newServer + ")");
+            }
+        });
     }
 
     /**
@@ -130,24 +127,25 @@ public class HandoffMessageListener implements PluginMessageListener {
      * Respond with STATUS_RESPONSE.
      */
     private void handleStatusQuery(Player proxyPlayer) {
-        boolean dbHealthy = database.isHealthy();
-        boolean redisHealthy = syncManager.isRedisHealthy();
-        int playerCount = Bukkit.getOnlinePlayers().size();
-        int pendingSaves = syncManager.getPendingSaveCount();
-        int pendingLoads = syncManager.getPendingLoadCount();
+        SchedulerUtil.runAsync(plugin, () -> {
+            boolean dbHealthy = database.isHealthy();
+            boolean redisHealthy = syncManager.isRedisHealthy();
+            int playerCount = syncManager.getActivePlayerCount();
+            int pendingSaves = syncManager.getPendingSaveCount();
+            int pendingLoads = syncManager.getPendingLoadCount();
 
-        byte[] response = encodeStatusResponse(
-            config.getServerName(), dbHealthy, redisHealthy,
-            playerCount, pendingSaves, pendingLoads);
+            byte[] response = encodeStatusResponse(
+                config.getServerName(), dbHealthy, redisHealthy,
+                playerCount, pendingSaves, pendingLoads);
+            SchedulerUtil.runAtEntity(plugin, proxyPlayer,
+                () -> proxyPlayer.sendPluginMessage(plugin, CHANNEL, response),
+                () -> logger.fine("[Handoff] Carrier player retired before STATUS_RESPONSE"));
 
-        if (proxyPlayer.isOnline()) {
-            proxyPlayer.sendPluginMessage(plugin, CHANNEL, response);
-        }
-
-        if (config.isDebug()) {
-            logger.info("[Handoff] STATUS_QUERY → db=" + dbHealthy +
-                " redis=" + redisHealthy + " players=" + playerCount);
-        }
+            if (config.isDebug()) {
+                logger.info("[Handoff] STATUS_QUERY → db=" + dbHealthy
+                    + " redis=" + redisHealthy + " players=" + playerCount);
+            }
+        });
     }
 
     // ==================== Encoding helpers ====================

@@ -7,7 +7,7 @@ import com.fastsync.log.OperationLog;
 import com.fastsync.sync.SyncManager;
 import com.fastsync.util.SchedulerUtil;
 import org.bukkit.Bukkit;
-import org.bukkit.ChatColor;
+import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
@@ -39,6 +39,20 @@ import java.util.logging.Level;
  *   6. Version byte prefix for future serialization format migration
  */
 public class FastSync extends JavaPlugin implements CommandExecutor, TabCompleter {
+
+    private static final LegacyComponentSerializer MESSAGE_SERIALIZER =
+        LegacyComponentSerializer.legacySection();
+    private static final String RED = "\u00a7c";
+    private static final String GREEN = "\u00a7a";
+    private static final String YELLOW = "\u00a7e";
+    private static final String GRAY = "\u00a77";
+    private static final String GOLD = "\u00a76";
+    private static final String AQUA = "\u00a7b";
+    private static final String WHITE = "\u00a7f";
+
+    private static void sendMessage(CommandSender sender, String message) {
+        sender.sendMessage(MESSAGE_SERIALIZER.deserialize(message));
+    }
 
     private ConfigManager configManager;
     private DatabaseManager databaseManager;
@@ -241,7 +255,7 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
     public boolean onCommand(@NotNull CommandSender sender, @NotNull Command command,
                              @NotNull String label, @NotNull String[] args) {
         if (!sender.hasPermission("fastsync.admin")) {
-            sender.sendMessage(ChatColor.RED + "You don't have permission to use this command.");
+            sendMessage(sender, RED + "You don't have permission to use this command.");
             return true;
         }
 
@@ -262,17 +276,17 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                 // Reset protection mode on reload — only if DB is healthy
                 boolean resetOk = syncManager.resetProtectionMode();
                 if (resetOk) {
-                    sender.sendMessage(ChatColor.GREEN + "[FastSync] Protection mode reset.");
+                    sendMessage(sender, GREEN + "[FastSync] Protection mode reset.");
                 } else {
-                    sender.sendMessage(ChatColor.RED + "[FastSync] Protection mode still active: database is unhealthy.");
+                    sendMessage(sender, RED + "[FastSync] Protection mode still active: database is unhealthy.");
                 }
-                sender.sendMessage(ChatColor.GREEN + "[FastSync] Configuration reloaded.");
-                sender.sendMessage(ChatColor.GRAY + "Server: " + configManager.getServerName());
-                sender.sendMessage(ChatColor.GRAY + "Compression: " +
+                sendMessage(sender, GREEN + "[FastSync] Configuration reloaded.");
+                sendMessage(sender, GRAY + "Server: " + configManager.getServerName());
+                sendMessage(sender, GRAY + "Compression: " +
                     (configManager.isCompressionEnabled() ? "LZ4" : "Disabled"));
-                sender.sendMessage(ChatColor.GRAY + "Redis: " +
+                sendMessage(sender, GRAY + "Redis: " +
                     (configManager.isRedisEnabled() ? "Enabled" : "Disabled"));
-                sender.sendMessage(ChatColor.GRAY + "Heartbeat: every " +
+                sendMessage(sender, GRAY + "Heartbeat: every " +
                     configManager.getHeartbeatIntervalSeconds() + "s (timer restarted)");
             }
             case "status" -> sendStatus(sender);
@@ -281,11 +295,11 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                 getConfig().set("debug", newDebug);
                 saveConfig();
                 configManager.reload();
-                sender.sendMessage(ChatColor.GREEN + "[FastSync] Debug mode: " +
-                    (newDebug ? ChatColor.GREEN + "ON" : ChatColor.RED + "OFF"));
+                sendMessage(sender, GREEN + "[FastSync] Debug mode: " +
+                    (newDebug ? GREEN + "ON" : RED + "OFF"));
             }
             case "saveall" -> {
-                sender.sendMessage(ChatColor.YELLOW + "[FastSync] Saving all online players...");
+                sendMessage(sender, YELLOW + "[FastSync] Saving all online players...");
                 // CRITICAL (Folia-safety): the save flow is split into two phases:
                 //
                 //   Phase 1 (dispatch) — runs on the global region. Captures the
@@ -309,21 +323,21 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                             SyncManager.SaveAllResult result = syncManager.waitForPlayerSaves(futures, SyncManager.SaveKind.BULK);
                             SchedulerUtil.runGlobal(this, () -> {
                                 if (result.allSucceeded()) {
-                                    sender.sendMessage(ChatColor.GREEN + "[FastSync] All " + result.total() + " players saved!");
+                                    sendMessage(sender, GREEN + "[FastSync] All " + result.total() + " players saved!");
                                 } else {
-                                    sender.sendMessage(ChatColor.YELLOW + "[FastSync] Saved " + result.success()
-                                        + "/" + result.total() + " players. " + ChatColor.RED + result.failed() + " failed.");
+                                    sendMessage(sender, YELLOW + "[FastSync] Saved " + result.success()
+                                        + "/" + result.total() + " players. " + RED + result.failed() + " failed.");
                                     if (!result.failures().isEmpty()) {
-                                        sender.sendMessage(ChatColor.GRAY + "Failed players:");
+                                        sendMessage(sender, GRAY + "Failed players:");
                                         result.failures().forEach((uuid, reason) ->
-                                            sender.sendMessage(ChatColor.GRAY + "  " + uuid + ": " + ChatColor.RED + reason));
+                                            sendMessage(sender, GRAY + "  " + uuid + ": " + RED + reason));
                                     }
                                 }
                             });
                         } catch (Exception e) {
                             getLogger().log(Level.SEVERE, "Saveall failed", e);
                             SchedulerUtil.runGlobal(this, () ->
-                                sender.sendMessage(ChatColor.RED + "[FastSync] Saveall failed: " + e.getMessage())
+                                sendMessage(sender, RED + "[FastSync] Saveall failed: " + e.getMessage())
                             );
                         }
                     });
@@ -331,7 +345,7 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
             }
             case "log" -> {
                 if (args.length < 2) {
-                    sender.sendMessage(ChatColor.RED + "Usage: /" + label + " log <player|uuid> [limit]");
+                    sendMessage(sender, RED + "Usage: /" + label + " log <player|uuid> [limit]");
                     return true;
                 }
                 int limit;
@@ -339,7 +353,7 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                     try {
                         limit = Math.min(Integer.parseInt(args[2]), 50);
                     } catch (NumberFormatException e) {
-                        sender.sendMessage(ChatColor.RED + "Invalid number: " + args[2]);
+                        sendMessage(sender, RED + "Invalid number: " + args[2]);
                         return true;
                     }
                 } else {
@@ -353,7 +367,7 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                     try {
                         targetUuid = UUID.fromString(args[1]);
                     } catch (IllegalArgumentException e) {
-                        sender.sendMessage(ChatColor.RED + "Player not found or invalid UUID: " + args[1]);
+                        sendMessage(sender, RED + "Player not found or invalid UUID: " + args[1]);
                         return true;
                     }
                 }
@@ -363,26 +377,26 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                     // Build all messages on async thread, then send on global thread
                     List<String> messages = new java.util.ArrayList<>();
                     if (logs.isEmpty()) {
-                        messages.add(ChatColor.YELLOW + "[FastSync] No operation log entries for " + args[1]);
+                        messages.add(YELLOW + "[FastSync] No operation log entries for " + args[1]);
                     } else {
-                        messages.add(ChatColor.GOLD + "===== Operation Log: " + args[1] + " (" + logs.size() + " entries) =====");
+                        messages.add(GOLD + "===== Operation Log: " + args[1] + " (" + logs.size() + " entries) =====");
                         for (OperationLog log : logs) {
-                            ChatColor typeColor = switch (log.type()) {
-                                case CONFLICT, CHECKSUM_FAIL, LOCK_EXPIRE -> ChatColor.RED;
-                                case SAVE, SNAPSHOT, RESTORE -> ChatColor.GREEN;
-                                case LOAD, LOCK_ACQUIRE, LOCK_RELEASE -> ChatColor.AQUA;
+                            String typeColor = switch (log.type()) {
+                                case CONFLICT, CHECKSUM_FAIL, LOCK_EXPIRE -> RED;
+                                case SAVE, SNAPSHOT, RESTORE -> GREEN;
+                                case LOAD, LOCK_ACQUIRE, LOCK_RELEASE -> AQUA;
                             };
-                            messages.add(ChatColor.GRAY + "#" + log.seq() + " " +
-                                typeColor + log.type() + ChatColor.GRAY +
+                            messages.add(GRAY + "#" + log.seq() + " " +
+                                typeColor + log.type() + GRAY +
                                 " | server=" + log.serverName() +
                                 " v=" + log.version() + " ft=" + log.fencingToken() +
                                 " sz=" + log.dataSize() + "B" +
-                                (log.detail() != null ? " | " + ChatColor.WHITE + log.detail() : ""));
+                                (log.detail() != null ? " | " + WHITE + log.detail() : ""));
                         }
                     }
                     SchedulerUtil.runGlobal(this, () -> {
                         for (String msg : messages) {
-                            sender.sendMessage(msg);
+                            sendMessage(sender, msg);
                         }
                     });
                 });
@@ -409,45 +423,45 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
     }
 
     private void sendHelp(CommandSender sender, String label) {
-        sender.sendMessage(ChatColor.GOLD + "===== FastSync =====");
-        sender.sendMessage(ChatColor.YELLOW + "/" + label + " reload " + ChatColor.GRAY + "- Reload configuration");
-        sender.sendMessage(ChatColor.YELLOW + "/" + label + " status " + ChatColor.GRAY + "- Show plugin status");
-        sender.sendMessage(ChatColor.YELLOW + "/" + label + " debug " + ChatColor.GRAY + "- Toggle debug mode");
-        sender.sendMessage(ChatColor.YELLOW + "/" + label + " saveall " + ChatColor.GRAY + "- Save all online players");
-        sender.sendMessage(ChatColor.YELLOW + "/" + label + " log <player> [n] " + ChatColor.GRAY + "- View operation log for a player");
+        sendMessage(sender, GOLD + "===== FastSync =====");
+        sendMessage(sender, YELLOW + "/" + label + " reload " + GRAY + "- Reload configuration");
+        sendMessage(sender, YELLOW + "/" + label + " status " + GRAY + "- Show plugin status");
+        sendMessage(sender, YELLOW + "/" + label + " debug " + GRAY + "- Toggle debug mode");
+        sendMessage(sender, YELLOW + "/" + label + " saveall " + GRAY + "- Save all online players");
+        sendMessage(sender, YELLOW + "/" + label + " log <player> [n] " + GRAY + "- View operation log for a player");
     }
 
     private void sendStatus(CommandSender sender) {
-        sender.sendMessage(ChatColor.GOLD + "===== FastSync Status =====");
-        sender.sendMessage(ChatColor.YELLOW + "Server: " + ChatColor.WHITE + configManager.getServerName());
-        sender.sendMessage(ChatColor.YELLOW + "Database: " +
-            (databaseManager.isHealthy() ? ChatColor.GREEN + "Connected" : ChatColor.RED + "Disconnected"));
-        sender.sendMessage(ChatColor.YELLOW + "Redis: " +
-            (syncManager.isRedisEnabled() ? ChatColor.GREEN + "Connected" :
-             (configManager.isRedisEnabled() ? ChatColor.RED + "Failed" : ChatColor.GRAY + "Disabled")));
-        sender.sendMessage(ChatColor.YELLOW + "Serialization: " + ChatColor.WHITE +
+        sendMessage(sender, GOLD + "===== FastSync Status =====");
+        sendMessage(sender, YELLOW + "Server: " + WHITE + configManager.getServerName());
+        sendMessage(sender, YELLOW + "Database: " +
+            (databaseManager.isHealthy() ? GREEN + "Connected" : RED + "Disconnected"));
+        sendMessage(sender, YELLOW + "Redis: " +
+            (syncManager.isRedisEnabled() ? GREEN + "Connected" :
+             (configManager.isRedisEnabled() ? RED + "Failed" : GRAY + "Disabled")));
+        sendMessage(sender, YELLOW + "Serialization: " + WHITE +
             "Paper native ItemStack byte serialization");
-        sender.sendMessage(ChatColor.YELLOW + "Active players: " + ChatColor.WHITE + syncManager.getActiveCount());
-        sender.sendMessage(ChatColor.YELLOW + "Pending loads: " + ChatColor.WHITE + syncManager.getPendingCount());
-        sender.sendMessage(ChatColor.YELLOW + "Pending saves: " + ChatColor.WHITE + syncManager.getPendingSaveCount());
-        sender.sendMessage(ChatColor.YELLOW + "Quarantined: " + ChatColor.WHITE + syncManager.getQuarantinedPlayerCount());
-        sender.sendMessage(ChatColor.YELLOW + "Protection mode: " +
-            (syncManager.isProtectionMode() ? ChatColor.RED + "ACTIVE (DB failures detected)" : ChatColor.GREEN + "Off"));
-        sender.sendMessage(ChatColor.YELLOW + "Heartbeat: " + ChatColor.WHITE +
+        sendMessage(sender, YELLOW + "Active players: " + WHITE + syncManager.getActiveCount());
+        sendMessage(sender, YELLOW + "Pending loads: " + WHITE + syncManager.getPendingCount());
+        sendMessage(sender, YELLOW + "Pending saves: " + WHITE + syncManager.getPendingSaveCount());
+        sendMessage(sender, YELLOW + "Quarantined: " + WHITE + syncManager.getQuarantinedPlayerCount());
+        sendMessage(sender, YELLOW + "Protection mode: " +
+            (syncManager.isProtectionMode() ? RED + "ACTIVE (DB failures detected)" : GREEN + "Off"));
+        sendMessage(sender, YELLOW + "Heartbeat: " + WHITE +
             "every " + configManager.getHeartbeatIntervalSeconds() + "s" +
             " (lock-timeout=" + configManager.getLockTimeout() + "s)");
-        sender.sendMessage(ChatColor.YELLOW + "Async threads: " + ChatColor.WHITE +
+        sendMessage(sender, YELLOW + "Async threads: " + WHITE +
             "active=" + syncManager.getAsyncActiveCount() +
             ", queue=" + syncManager.getAsyncQueueSize());
-        ChatColor finalSaveColor = syncManager.hasFinalSaveAlert() ? ChatColor.RED : ChatColor.GREEN;
-        sender.sendMessage(ChatColor.YELLOW + "Final-save: " + finalSaveColor +
+        String finalSaveColor = syncManager.hasFinalSaveAlert() ? RED : GREEN;
+        sendMessage(sender, YELLOW + "Final-save: " + finalSaveColor +
             "active=" + syncManager.getFinalSaveActiveCount() +
             ", queue=" + syncManager.getFinalSaveQueueSize() + "/" + syncManager.getFinalSaveQueueCapacity() +
             ", queueFull=" + syncManager.getFinalSaveQueueFullTotal() +
             ", syncFallback=" + syncManager.getFinalSaveSyncFallbackTotal());
         if (syncManager.hasFinalSaveAlert()) {
             long lastFallbackAt = syncManager.getFinalSaveLastFallbackAt();
-            sender.sendMessage(ChatColor.RED + "Final-save ALERT: synchronous fallback occurred"
+            sendMessage(sender, RED + "Final-save ALERT: synchronous fallback occurred"
                 + (lastFallbackAt > 0 ? " at " + new java.util.Date(lastFallbackAt) : "")
                 + ". Investigate DB latency / queue sizing before scaling up.");
         }
@@ -455,50 +469,50 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         long spoolPending = syncManager.getFinalSaveSpoolPendingCount();
         long spoolFailed = syncManager.getFinalSaveSpoolFailedCount();
         if (spoolPending > 0 || spoolFailed > 0 || configManager.isFinalSaveSpoolEnabled()) {
-            ChatColor spoolColor = spoolFailed > 0 ? ChatColor.RED : (spoolPending > 0 ? ChatColor.YELLOW : ChatColor.GREEN);
-            sender.sendMessage(ChatColor.YELLOW + "FinalSaveSpool: " + spoolColor +
+            String spoolColor = spoolFailed > 0 ? RED : (spoolPending > 0 ? YELLOW : GREEN);
+            sendMessage(sender, YELLOW + "FinalSaveSpool: " + spoolColor +
                 "pending=" + spoolPending +
                 ", failed=" + spoolFailed +
                 ", bytes=" + syncManager.getFinalSaveSpoolBytes());
             long lastReplay = syncManager.getFinalSaveSpoolLastReplayAt();
             if (lastReplay > 0) {
-                sender.sendMessage(ChatColor.YELLOW + "  lastReplay=" + ChatColor.WHITE
+                sendMessage(sender, YELLOW + "  lastReplay=" + WHITE
                     + new java.util.Date(lastReplay));
             }
             String lastError = syncManager.getFinalSaveSpoolLastError();
             if (lastError != null && !lastError.isEmpty()) {
-                sender.sendMessage(ChatColor.RED + "  lastError=" + lastError);
+                sendMessage(sender, RED + "  lastError=" + lastError);
             }
             if (spoolFailed > 0) {
-                sender.sendMessage(ChatColor.RED + "Spool FAILED entries exist — check "
+                sendMessage(sender, RED + "Spool FAILED entries exist — check "
                     + configManager.getFinalSaveSpoolDir() + "/failed/ for .reason.txt files.");
             }
         }
         if (configManager.isOperationLogEnabled()) {
             long dropped = syncManager.getOperationLogDroppedTotal();
-            ChatColor opLogColor = dropped > 0 ? ChatColor.RED : ChatColor.GREEN;
-            sender.sendMessage(ChatColor.YELLOW + "OpLog: " + opLogColor +
+            String opLogColor = dropped > 0 ? RED : GREEN;
+            sendMessage(sender, YELLOW + "OpLog: " + opLogColor +
                 "queue=" + syncManager.getOperationLogQueueSize() + "/" + syncManager.getOperationLogQueueCapacity() +
                 ", dropped=" + dropped);
             if (dropped > 0) {
                 long lastDropAt = syncManager.getOperationLogLastDropAt();
-                sender.sendMessage(ChatColor.RED + "OpLog ALERT: audit entries have been dropped"
+                sendMessage(sender, RED + "OpLog ALERT: audit entries have been dropped"
                     + (lastDropAt > 0 ? " since " + new java.util.Date(lastDropAt) : "")
                     + ". Treat operation log as incomplete for incident review.");
             }
         } else {
-            sender.sendMessage(ChatColor.YELLOW + "OpLog: " + ChatColor.GRAY + "Disabled");
+            sendMessage(sender, YELLOW + "OpLog: " + GRAY + "Disabled");
         }
-        sender.sendMessage(ChatColor.YELLOW + "Compression: " +
-            (configManager.isCompressionEnabled() ? ChatColor.GREEN + "LZ4" : ChatColor.RED + "Disabled"));
-        sender.sendMessage(ChatColor.YELLOW + "Debug: " +
-            (configManager.isDebug() ? ChatColor.GREEN + "ON" : ChatColor.RED + "OFF"));
+        sendMessage(sender, YELLOW + "Compression: " +
+            (configManager.isCompressionEnabled() ? GREEN + "LZ4" : RED + "Disabled"));
+        sendMessage(sender, YELLOW + "Debug: " +
+            (configManager.isDebug() ? GREEN + "ON" : RED + "OFF"));
 
         // HikariCP stats
         if (databaseManager.getDataSource() != null) {
             var pool = databaseManager.getDataSource().getHikariPoolMXBean();
             if (pool != null) {
-                sender.sendMessage(ChatColor.YELLOW + "DB Pool: " + ChatColor.WHITE +
+                sendMessage(sender, YELLOW + "DB Pool: " + WHITE +
                     "active=" + pool.getActiveConnections() +
                     ", idle=" + pool.getIdleConnections() +
                     ", total=" + pool.getTotalConnections() +
@@ -507,29 +521,29 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         }
 
         // Latency stats (Dynamo p99.9)
-        sender.sendMessage(ChatColor.YELLOW + "Latency: " + ChatColor.GRAY + "(p50/p99/p99.9)");
+        sendMessage(sender, YELLOW + "Latency: " + GRAY + "(p50/p99/p99.9)");
         syncManager.logLatencyStats();
 
         // Stream stats
-        sender.sendMessage(ChatColor.YELLOW + "Streams: " +
-            (configManager.isStreamsEnabled() ? ChatColor.GREEN + "Enabled" : ChatColor.RED + "Disabled"));
+        sendMessage(sender, YELLOW + "Streams: " +
+            (configManager.isStreamsEnabled() ? GREEN + "Enabled" : RED + "Disabled"));
 
         // Snapshot stats (round 14b)
         if (syncManager.getSnapshotManager() != null) {
             var sm = syncManager.getSnapshotManager();
             long rejected = sm.getRejectedCount();
-            ChatColor snapColor = rejected > 0 ? ChatColor.RED : ChatColor.GREEN;
-            sender.sendMessage(ChatColor.YELLOW + "Snapshots: " + snapColor +
+            String snapColor = rejected > 0 ? RED : GREEN;
+            sendMessage(sender, YELLOW + "Snapshots: " + snapColor +
                 "queue=" + sm.getQueueSize() + "/" + sm.getQueueCapacity() +
                 ", rejected=" + rejected);
         }
 
         // Cluster + production mode (round 14b)
-        sender.sendMessage(ChatColor.YELLOW + "Cluster: " + ChatColor.WHITE +
+        sendMessage(sender, YELLOW + "Cluster: " + WHITE +
             (configManager.getClusterId() != null && !configManager.getClusterId().isBlank()
                 ? configManager.getClusterId() : "(none)"));
         if (configManager.isProductionEnabled()) {
-            sender.sendMessage(ChatColor.YELLOW + "Production: " + ChatColor.GREEN + "ON" +
+            sendMessage(sender, YELLOW + "Production: " + GREEN + "ON" +
                 " (redis=" + (configManager.isProductionRequireRedis() ? "required" : "optional") +
                 ", sync-fallback=" + (configManager.isFinalSaveAllowSyncFallback() ? "allowed" : "blocked") + ")");
         }

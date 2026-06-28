@@ -24,5 +24,5 @@ public record FinalSaveSpoolRecord(
     int attempts,
     String lastError
 ) {
-    public static final int CURRENT_FORMAT = 1;
+    public static final int CURRENT_FORMAT = 2;
 }

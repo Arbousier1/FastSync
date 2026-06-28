@@ -590,6 +590,47 @@ public class ConfigManager {
         finalSaveSpoolReplayIntervalTicks = source.getLong("final-save.spool.replay-interval-ticks", 100);
         finalSaveSpoolReplayBatchSize = source.getInt("final-save.spool.replay-batch-size", 64);
         finalSaveSpoolRetainFailedDays = source.getInt("final-save.spool.retain-failed-days", 7);
+        if (finalSaveThreads < 1) {
+            logger.warning("[Config] final-save.threads must be >= 1. Using 1.");
+            finalSaveThreads = 1;
+        }
+        if (finalSaveQueueCapacity < 1) {
+            logger.warning("[Config] final-save.queue-capacity must be >= 1. Using 1.");
+            finalSaveQueueCapacity = 1;
+        }
+        if (finalSaveShutdownTimeoutSeconds < 1) {
+            logger.warning("[Config] final-save.shutdown-timeout-seconds must be >= 1. Using 1.");
+            finalSaveShutdownTimeoutSeconds = 1;
+        }
+        if (finalSaveSpoolDir == null || finalSaveSpoolDir.isBlank()) {
+            finalSaveSpoolDir = "final-save-spool";
+        }
+        java.nio.file.Path configuredSpoolDir = java.nio.file.Path.of(finalSaveSpoolDir).normalize();
+        if (configuredSpoolDir.isAbsolute() || configuredSpoolDir.startsWith("..")) {
+            throw new RuntimeException(
+                "final-save.spool.dir must stay inside the FastSync data directory: " + finalSaveSpoolDir);
+        }
+        finalSaveSpoolDir = configuredSpoolDir.toString();
+        if (finalSaveSpoolMaxFiles < 1) {
+            logger.warning("[Config] final-save.spool.max-files must be >= 1. Using 1.");
+            finalSaveSpoolMaxFiles = 1;
+        }
+        if (finalSaveSpoolMaxBytes < 1) {
+            logger.warning("[Config] final-save.spool.max-bytes must be >= 1. Using 1.");
+            finalSaveSpoolMaxBytes = 1;
+        }
+        if (finalSaveSpoolReplayIntervalTicks < 1) {
+            logger.warning("[Config] final-save.spool.replay-interval-ticks must be >= 1. Using 1.");
+            finalSaveSpoolReplayIntervalTicks = 1;
+        }
+        if (finalSaveSpoolReplayBatchSize < 1) {
+            logger.warning("[Config] final-save.spool.replay-batch-size must be >= 1. Using 1.");
+            finalSaveSpoolReplayBatchSize = 1;
+        }
+        if (finalSaveSpoolRetainFailedDays < 0) {
+            logger.warning("[Config] final-save.spool.retain-failed-days must be >= 0. Using 0.");
+            finalSaveSpoolRetainFailedDays = 0;
+        }
 
         // Locked commands while loading
         cancelCommandsWhileLocked = source.getBoolean("sync.cancel-commands-while-locked", false);

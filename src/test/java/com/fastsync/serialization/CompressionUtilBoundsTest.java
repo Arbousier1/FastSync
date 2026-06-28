@@ -102,6 +102,23 @@ class CompressionUtilBoundsTest {
     }
 
     @Test
+    void unwrapRejectsUnsupportedFlags() {
+        byte[] wrapped = {CompressionUtil.FORMAT_VERSION, (byte) 0x40, 1, 2};
+        CorruptDataException ex = assertThrows(CorruptDataException.class,
+            () -> CompressionUtil.unwrap(wrapped));
+        assertTrue(ex.getMessage().contains("Unsupported compression flags"));
+    }
+
+    @Test
+    void uncompressedPayloadAlsoHonorsRawLimit() {
+        CompressionUtil.configureLimits(4, 100);
+        byte[] wrapped = {CompressionUtil.FORMAT_VERSION, 0, 1, 2, 3, 4, 5};
+        assertThrows(CorruptDataException.class, () -> CompressionUtil.unwrap(wrapped));
+        assertThrows(CorruptDataException.class,
+            () -> CompressionUtil.wrap(new byte[]{1, 2, 3, 4, 5}, 100));
+    }
+
+    @Test
     void unwrapRejectsNullAndTooShort() {
         assertThrows(CorruptDataException.class, () -> CompressionUtil.unwrap(null));
         assertThrows(CorruptDataException.class, () -> CompressionUtil.unwrap(new byte[]{1}));

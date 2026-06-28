@@ -450,6 +450,7 @@ class SyncManagerRound15Test {
         return f.getBoolean(target);
     }
 
+    @SuppressWarnings("unchecked")
     private <T> T getField(String name) throws Exception {
         Field f = SyncManager.class.getDeclaredField(name);
         f.setAccessible(true);

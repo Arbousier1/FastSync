@@ -69,6 +69,10 @@ dependencies {
     implementation("com.zaxxer:HikariCP:7.1.0")
     implementation("at.yawk.lz4:lz4-java:1.11.0")
     implementation("org.jooq:jooq:3.21.6")
+    // jOOQ marks JAXB annotations as optional, but its public class files use
+    // them. Keep the API on the compile classpath so clean -Xlint builds can
+    // inspect those annotations without emitting missing-class warnings.
+    compileOnly("jakarta.xml.bind:jakarta.xml.bind-api:4.0.2")
     implementation("com.github.ben-manes.caffeine:caffeine:3.2.4")
     // jOOQ 3.21 has a transitive dependency on io.r2dbc:r2dbc-spi (jOOQ's R2DBC
     // support). jOOQ's static initializer references io.r2dbc.spi.ConnectionFactory
@@ -210,10 +214,13 @@ tasks.named<Copy>("processVelocityResources") {
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
 
-val velocityOnly by configurations.creating
+val velocityOnly = configurations.create("velocityOnly")
 dependencies {
     add("velocityOnly", "com.velocitypowered:velocity-api:3.5.0-SNAPSHOT")
     add("velocityOnly", "org.slf4j:slf4j-api:2.0.18")
+    // Adventure exposes JetBrains annotations in its public API but does not
+    // publish them transitively for this custom compile-only configuration.
+    add("velocityOnly", "org.jetbrains:annotations:26.0.2-1")
     // Netty BOM as platform (see main dependencies block for rationale)
     add("velocityOnly", platform("io.netty:netty-bom:4.2.15.Final"))
     add("velocityOnly", "io.netty:netty-transport:4.2.15.Final")

@@ -98,6 +98,10 @@ public class CompressionUtil {
         if (data == null || data.length == 0) {
             return new byte[] { FORMAT_VERSION, 0 };
         }
+        if (data.length > maxRawBytes) {
+            throw new CorruptDataException("Raw payload exceeds configured limit: "
+                + data.length + " > " + maxRawBytes + " bytes");
+        }
 
         boolean shouldCompress = data.length >= minSize;
         if (shouldCompress) {
@@ -121,6 +125,10 @@ public class CompressionUtil {
                 result[4] = (byte) (data.length >>> 8);
                 result[5] = (byte) (data.length);
                 System.arraycopy(tmp, 0, result, 6, compressedLen);
+                if (result.length > maxWrappedBytes) {
+                    throw new CorruptDataException("Wrapped payload exceeds configured limit: "
+                        + result.length + " > " + maxWrappedBytes + " bytes");
+                }
                 return result;
             }
         }
@@ -130,6 +138,10 @@ public class CompressionUtil {
         result[0] = FORMAT_VERSION;
         result[1] = 0; // not compressed
         System.arraycopy(data, 0, result, 2, data.length);
+        if (result.length > maxWrappedBytes) {
+            throw new CorruptDataException("Wrapped payload exceeds configured limit: "
+                + result.length + " > " + maxWrappedBytes + " bytes");
+        }
         return result;
     }
 
@@ -167,6 +179,10 @@ public class CompressionUtil {
         if (version != FORMAT_VERSION) {
             throw new CorruptDataException("Unsupported format version: " + version
                 + " (expected " + FORMAT_VERSION + ")");
+        }
+        if ((flags & ~FLAG_COMPRESSED) != 0) {
+            throw new CorruptDataException("Unsupported compression flags: 0x"
+                + Integer.toHexString(flags & 0xFF));
         }
 
         boolean compressed = (flags & FLAG_COMPRESSED) != 0;
@@ -206,6 +222,11 @@ public class CompressionUtil {
             }
             return restored;
         } else {
+            int rawLength = wrappedData.length - 2;
+            if (rawLength > maxRawBytes) {
+                throw new CorruptDataException("Raw payload exceeds limit: "
+                    + rawLength + " > " + maxRawBytes + " bytes");
+            }
             // Uncompressed path: still need a copy because callers may mutate
             // the returned array, but it's a single allocation.
             byte[] result = new byte[wrappedData.length - 2];

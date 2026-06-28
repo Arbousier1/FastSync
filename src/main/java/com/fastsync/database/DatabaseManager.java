@@ -765,10 +765,10 @@ public class DatabaseManager {
     public boolean saveDataKeepLockClearComponents(UUID uuid, byte[] data, long checksum,
             long expectedVersion, long fencingToken, String serverName, String lockSessionId) throws SQLException {
         requireLockSession(lockSessionId, "saveDataKeepLockClearComponents");
-        long now = System.currentTimeMillis();
         try (Connection conn = dataSource.getConnection()) {
             conn.setAutoCommit(false);
             try {
+                long now = getDatabaseTimeMs(conn);
                 String sql = String.format(
                     "UPDATE `%s` SET `data` = ?, `version` = `version` + 1, `checksum` = ?, " +
                     "`last_server` = ?, `last_updated` = ?, `locked_at` = ?, " +
@@ -1399,12 +1399,11 @@ public class DatabaseManager {
         if (componentsWithData == null || componentsWithData.isEmpty()) {
             return ComponentBatchResult.rejected("no components to upsert", ComponentRejectReason.NO_COMPONENTS);
         }
-        long now = System.currentTimeMillis();
-
         try (Connection conn = dataSource.getConnection()) {
             boolean oldAutoCommit = conn.getAutoCommit();
             conn.setAutoCommit(false);
             try {
+                long now = getDatabaseTimeMs(conn);
                 // 1. Lock player_data row and read metadata (including lock_session_id)
                 String lockSql = String.format(
                     "SELECT `version`, `fencing_token`, `locked_by`, `lock_session_id`, `component_bitmap`, `component_generation` " +

@@ -8,7 +8,9 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.EntityDamageEvent;
+import org.bukkit.event.entity.EntityPickupItemEvent;
 import org.bukkit.event.entity.EntityPotionEffectEvent;
+import org.bukkit.event.entity.EntityRegainHealthEvent;
 import org.bukkit.event.entity.FoodLevelChangeEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
@@ -19,9 +21,12 @@ import org.bukkit.event.player.PlayerExpChangeEvent;
 import org.bukkit.event.player.PlayerGameModeChangeEvent;
 import org.bukkit.event.player.PlayerItemBreakEvent;
 import org.bukkit.event.player.PlayerItemConsumeEvent;
-import org.bukkit.event.player.PlayerPickupItemEvent;
+import org.bukkit.event.player.PlayerLevelChangeEvent;
 import org.bukkit.event.player.PlayerRespawnEvent;
+import org.bukkit.event.player.PlayerSwapHandItemsEvent;
 import org.bukkit.event.player.PlayerTeleportEvent;
+import org.bukkit.event.player.PlayerToggleFlightEvent;
+import org.bukkit.event.inventory.InventoryType;
 import org.bukkit.inventory.InventoryHolder;
 
 import java.util.UUID;
@@ -68,8 +73,7 @@ public class DirtyTrackingListener implements Listener {
             // Ender chest detection: if the clicked inventory is an ender chest,
             // mark ENDER_CHEST dirty separately. The inventory holder check
             // distinguishes ender chest from regular inventory/crafting.
-            var inv = event.getClickedInventory();
-            if (inv != null && inv.getHolder() instanceof org.bukkit.block.EnderChest) {
+            if (event.getView().getTopInventory().getType() == InventoryType.ENDER_CHEST) {
                 markDirty(p, Component.ENDER_CHEST);
             }
         }
@@ -81,8 +85,7 @@ public class DirtyTrackingListener implements Listener {
         if (event.getWhoClicked() instanceof Player p) {
             markDirty(p, Component.INVENTORY);
             // Check if any of the dragged slots are in an ender chest inventory
-            var inv = event.getInventory();
-            if (inv != null && inv.getHolder() instanceof org.bukkit.block.EnderChest) {
+            if (event.getView().getTopInventory().getType() == InventoryType.ENDER_CHEST) {
                 markDirty(p, Component.ENDER_CHEST);
             }
         }
@@ -96,8 +99,7 @@ public class DirtyTrackingListener implements Listener {
     @EventHandler(priority = EventPriority.MONITOR)
     public void onInventoryClose(InventoryCloseEvent event) {
         if (event.getPlayer() instanceof Player p) {
-            var inv = event.getInventory();
-            if (inv != null && inv.getHolder() instanceof org.bukkit.block.EnderChest) {
+            if (event.getInventory().getType() == InventoryType.ENDER_CHEST) {
                 markDirty(p, Component.ENDER_CHEST);
             }
         }
@@ -110,9 +112,11 @@ public class DirtyTrackingListener implements Listener {
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
-    public void onItemPickup(PlayerPickupItemEvent event) {
+    public void onItemPickup(EntityPickupItemEvent event) {
         if (event.isCancelled()) return;
-        markDirty(event.getPlayer(), Component.INVENTORY);
+        if (event.getEntity() instanceof Player player) {
+            markDirty(player, Component.INVENTORY);
+        }
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
@@ -124,6 +128,13 @@ public class DirtyTrackingListener implements Listener {
     public void onItemConsume(PlayerItemConsumeEvent event) {
         if (event.isCancelled()) return;
         markDirty(event.getPlayer(), Component.INVENTORY);
+        markDirty(event.getPlayer(), Component.FOOD);
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onSwapHandItems(PlayerSwapHandItemsEvent event) {
+        if (event.isCancelled()) return;
+        markDirty(event.getPlayer(), Component.INVENTORY);
     }
 
     // ==================== Vitals (health) ====================
@@ -133,6 +144,14 @@ public class DirtyTrackingListener implements Listener {
         if (event.isCancelled()) return;
         if (event.getEntity() instanceof Player p) {
             markDirty(p, Component.VITALS);
+        }
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onEntityRegainHealth(EntityRegainHealthEvent event) {
+        if (event.isCancelled()) return;
+        if (event.getEntity() instanceof Player player) {
+            markDirty(player, Component.VITALS);
         }
     }
 
@@ -150,6 +169,11 @@ public class DirtyTrackingListener implements Listener {
 
     @EventHandler(priority = EventPriority.MONITOR)
     public void onExpChange(PlayerExpChangeEvent event) {
+        markDirty(event.getPlayer(), Component.EXPERIENCE);
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onLevelChange(PlayerLevelChangeEvent event) {
         markDirty(event.getPlayer(), Component.EXPERIENCE);
     }
 
@@ -179,6 +203,12 @@ public class DirtyTrackingListener implements Listener {
         markDirty(event.getPlayer(), Component.LOCATION);
     }
 
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onToggleFlight(PlayerToggleFlightEvent event) {
+        if (event.isCancelled()) return;
+        markDirty(event.getPlayer(), Component.FLIGHT);
+    }
+
     // ==================== Death / Respawn ====================
 
     @EventHandler(priority = EventPriority.MONITOR)
@@ -197,6 +227,7 @@ public class DirtyTrackingListener implements Listener {
         markDirty(event.getPlayer(), Component.FOOD);
         markDirty(event.getPlayer(), Component.FIRE_TICKS);
         markDirty(event.getPlayer(), Component.POTION_EFFECTS);
+        markDirty(event.getPlayer(), Component.LOCATION);
     }
 
     // ==================== Helper ====================

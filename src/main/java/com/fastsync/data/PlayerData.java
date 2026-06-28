@@ -240,6 +240,7 @@ public class PlayerData {
     }
 
     public static class ModifierData {
+        // Namespaced modifier key in current payloads; legacy payloads contain UUIDs.
         private final String uuid;
         private final String name;
         private final double amount;

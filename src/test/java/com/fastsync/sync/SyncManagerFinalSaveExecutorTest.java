@@ -93,6 +93,7 @@ class SyncManagerFinalSaveExecutorTest {
         assertNull(finalAfter, "finalSaveExecutor must be nulled after shutdown");
     }
 
+    @SuppressWarnings("unchecked")
     private <T> T getField(String name) throws Exception {
         Field f = SyncManager.class.getDeclaredField(name);
         f.setAccessible(true);

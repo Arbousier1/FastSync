@@ -183,15 +183,15 @@ public class RedissonManager {
      */
     public void initialize() {
         Config config = new Config();
+        if (password != null && !password.isEmpty()) {
+            config.setPassword(password);
+        }
         String scheme = ssl ? "rediss://" : "redis://";
         SingleServerConfig single = config.useSingleServer()
             .setAddress(scheme + host + ":" + port)
             .setDatabase(database)
             .setConnectTimeout(timeout)
             .setTimeout(timeout);
-        if (password != null && !password.isEmpty()) {
-            single.setPassword(password);
-        }
 
         try {
             client = Redisson.create(config);

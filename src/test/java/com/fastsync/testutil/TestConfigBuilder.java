@@ -73,6 +73,16 @@ public class TestConfigBuilder {
         return this;
     }
 
+    public TestConfigBuilder withClusterId(String clusterId) throws ReflectiveOperationException {
+        set("clusterId", clusterId);
+        return this;
+    }
+
+    public TestConfigBuilder withTablePrefix(String tablePrefix) throws ReflectiveOperationException {
+        set("tablePrefix", tablePrefix);
+        return this;
+    }
+
     public ConfigManager build() {
         return config;
     }

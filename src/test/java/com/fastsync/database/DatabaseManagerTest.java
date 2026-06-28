@@ -1,7 +1,9 @@
 package com.fastsync.database;
 
 import com.fastsync.config.ConfigManager;
+import com.fastsync.snapshot.SnapshotManager;
 import com.fastsync.testutil.TestConfigBuilder;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeAll;
@@ -13,6 +15,7 @@ import org.testcontainers.utility.DockerImageName;
 
 import java.sql.SQLException;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -87,6 +90,13 @@ class DatabaseManagerTest {
         try (var conn = databaseManager.getDataSource().getConnection();
              var stmt = conn.createStatement()) {
             stmt.execute("TRUNCATE TABLE " + config.getTablePrefix() + "player_data");
+        }
+    }
+
+    @AfterEach
+    void tearDown() {
+        if (databaseManager != null) {
+            databaseManager.close();
         }
     }
 
@@ -279,5 +289,49 @@ class DatabaseManagerTest {
 
         assertTrue(failed.contains(uuid),
             "Player with a blank session id must be reported failed (fail-closed)");
+    }
+
+    @Test
+    void snapshotIdOperationsCannotCrossClusterBoundary() throws Exception {
+        ConfigManager otherConfig = new TestConfigBuilder()
+            .defaults()
+            .withClusterId("other-cluster")
+            .withTablePrefix(config.getTablePrefix())
+            .withDatabase(
+                mysql.getHost(), mysql.getMappedPort(3306), mysql.getDatabaseName(),
+                mysql.getUsername(), mysql.getPassword())
+            .build();
+        DatabaseManager otherDatabase = new DatabaseManager(LOGGER, otherConfig);
+        SnapshotManager ownerSnapshots = new SnapshotManager(LOGGER, config);
+        SnapshotManager otherSnapshots = new SnapshotManager(LOGGER, otherConfig);
+
+        try {
+            otherDatabase.initialize();
+            ownerSnapshots.initialize(databaseManager);
+            otherSnapshots.initialize(otherDatabase);
+
+            UUID uuid = UUID.randomUUID();
+            byte[] data = {1, 2, 3, 4};
+            long snapshotId = ownerSnapshots.createSnapshot(uuid, data, "test")
+                .get(10, TimeUnit.SECONDS);
+
+            assertNull(otherSnapshots.loadSnapshot(snapshotId).get(10, TimeUnit.SECONDS),
+                "A different cluster must not read a snapshot by guessing its global id");
+
+            otherSnapshots.pinSnapshot(snapshotId, true).get(10, TimeUnit.SECONDS);
+            var ownerList = ownerSnapshots.listSnapshots(uuid).get(10, TimeUnit.SECONDS);
+            assertEquals(1, ownerList.size());
+            assertFalse(ownerList.getFirst().isPinned(),
+                "A different cluster must not mutate snapshot metadata");
+
+            otherSnapshots.deleteSnapshot(snapshotId).get(10, TimeUnit.SECONDS);
+            assertArrayEquals(data,
+                ownerSnapshots.loadSnapshot(snapshotId).get(10, TimeUnit.SECONDS),
+                "A different cluster must not delete a snapshot by id");
+        } finally {
+            ownerSnapshots.close();
+            otherSnapshots.close();
+            otherDatabase.close();
+        }
     }
 }

@@ -1,13 +1,14 @@
 package com.fastsync.spool;
 
 import com.fastsync.database.DatabaseManager;
+import com.fastsync.util.SchedulerUtil;
 import org.bukkit.plugin.Plugin;
-import org.bukkit.scheduler.BukkitRunnable;
 
 import java.nio.file.Path;
 import java.util.List;
 import java.util.UUID;
 import java.util.function.Consumer;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -38,6 +39,8 @@ import java.util.logging.Logger;
  */
 public class FinalSaveReplayService {
 
+    private static final int MAX_REPLAY_ATTEMPTS = 3;
+
     private final Logger logger;
     private final FinalSaveSpool spool;
     private final DatabaseManager databaseManager;
@@ -48,8 +51,9 @@ public class FinalSaveReplayService {
     /** Called with the player UUID after a successful replay so other servers
      *  on Redis pub/sub are notified the lock was released. May be null. */
     private final Consumer<UUID> lockReleasedCallback;
-    private BukkitRunnable task;
+    private Object task;
     private volatile boolean running = false;
+    private final AtomicBoolean replaying = new AtomicBoolean(false);
 
     public FinalSaveReplayService(Logger logger, FinalSaveSpool spool,
                                    DatabaseManager databaseManager, Plugin plugin,
@@ -68,24 +72,11 @@ public class FinalSaveReplayService {
     public void start() {
         if (running) return;
         running = true;
-        // Run first replay asynchronously so it does not block plugin enable
-        // / server startup when many spool files are pending from a previous
-        // crash. Using BukkitRunnable keeps this Folia-compatible.
-        new BukkitRunnable() {
-            @Override
-            public void run() {
-                replayBatch();
-            }
-        }.runTaskAsynchronously(plugin);
-
-        // Then schedule periodic replay
-        task = new BukkitRunnable() {
-            @Override
-            public void run() {
-                replayBatch();
-            }
-        };
-        task.runTaskTimerAsynchronously(plugin, intervalTicks, intervalTicks);
+        // The immediate run and timer can overlap during a slow DB recovery.
+        // replayBatch has a CAS guard so only one worker can mutate pending files.
+        SchedulerUtil.runAsync(plugin, this::replayBatch);
+        task = SchedulerUtil.runAsyncTimer(
+            plugin, this::replayBatch, intervalTicks, intervalTicks);
         logger.info("[FinalSaveReplay] Started: batch=" + batchSize
             + " interval=" + intervalTicks + " ticks");
     }
@@ -93,13 +84,35 @@ public class FinalSaveReplayService {
     public void stop() {
         running = false;
         if (task != null) {
-            task.cancel();
+            SchedulerUtil.cancel(task);
             task = null;
+        }
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+        while (replaying.get() && System.nanoTime() < deadline) {
+            try {
+                Thread.sleep(10);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+        if (replaying.get()) {
+            logger.warning("[FinalSaveReplay] Replay is still running after shutdown wait; "
+                + "resource shutdown may overlap its current database operation.");
         }
     }
 
     private void replayBatch() {
-        if (!running) return;
+        if (!running || !replaying.compareAndSet(false, true)) return;
+        try {
+            replayBatchExclusive();
+        } finally {
+            replaying.set(false);
+        }
+    }
+
+    private void replayBatchExclusive() {
+        spool.cleanupExpiredFailed();
         List<Path> files = spool.listPending(batchSize);
         if (files.isEmpty()) return;
 
@@ -111,6 +124,12 @@ public class FinalSaveReplayService {
         for (Path file : files) {
             try {
                 FinalSaveSpoolRecord rec = spool.read(file);
+                if (!databaseManager.getClusterId().equals(rec.clusterId())) {
+                    spool.moveToFailed(file, "CLUSTER_MISMATCH: record=" + rec.clusterId()
+                        + " current=" + databaseManager.getClusterId());
+                    failed++;
+                    continue;
+                }
                 boolean ok = false;
                 try {
                     ok = databaseManager.saveDataAndReleaseLockClearComponents(
@@ -176,13 +195,17 @@ public class FinalSaveReplayService {
                         // Same-fencing self-conflict: our own earlier save
                         // advanced the version while this spooled save was
                         // waiting. Retry with the actual version (up to 3
-                        // attempts).
-                        if (rec.attempts() < 3) {
+                        // attempts). attempts stores prior failed CAS attempts;
+                        // the current DB call is attempt number attempts+1.
+                        int attemptNumber = rec.attempts() + 1;
+                        if (attemptNumber < MAX_REPLAY_ATTEMPTS) {
                             try {
-                                spool.rewriteWithUpdatedVersion(file, state.version());
+                                String retryReason = "same-session conflict: expected v"
+                                    + rec.expectedVersion() + ", actual v" + state.version();
+                                spool.rewriteWithUpdatedVersion(file, state.version(), retryReason);
                                 logger.info("[FinalSaveReplay] Same-fencing retry for " + rec.uuid()
                                     + ": v" + rec.expectedVersion() + " -> v" + state.version()
-                                    + " (attempt " + (rec.attempts() + 1) + "/3)");
+                                    + " (attempt " + attemptNumber + "/" + MAX_REPLAY_ATTEMPTS + ")");
                                 retained++;
                             } catch (Exception rewriteEx) {
                                 logger.log(Level.WARNING, "[FinalSaveReplay] Failed to rewrite spool for " + rec.uuid(), rewriteEx);
@@ -190,7 +213,8 @@ public class FinalSaveReplayService {
                                 failed++;
                             }
                         } else {
-                            spool.moveToFailed(file, "MAX_RETRIES_EXCEEDED: same-fencing conflict after 3 attempts");
+                            spool.moveToFailed(file, "MAX_RETRIES_EXCEEDED: same-fencing conflict after "
+                                + MAX_REPLAY_ATTEMPTS + " attempts");
                             failed++;
                         }
                     } else {

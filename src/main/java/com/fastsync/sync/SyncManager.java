@@ -300,7 +300,10 @@ public class SyncManager {
                 java.nio.file.Path spoolDir = plugin.getDataFolder().toPath()
                     .resolve(config.getFinalSaveSpoolDir());
                 finalSaveSpool = new com.fastsync.spool.FinalSaveSpool(
-                    logger, spoolDir, config.isFinalSaveSpoolFsync());
+                    logger, spoolDir, config.isFinalSaveSpoolFsync(),
+                    config.getFinalSaveSpoolMaxFiles(),
+                    config.getFinalSaveSpoolMaxBytes(),
+                    config.getFinalSaveSpoolRetainFailedDays());
                 if (config.isFinalSaveSpoolReplayOnStartup()) {
                     finalSaveReplayService = new com.fastsync.spool.FinalSaveReplayService(
                         logger, finalSaveSpool, databaseManager, plugin,
@@ -857,12 +860,18 @@ public class SyncManager {
         try {
         // Clear current state to prevent duplication
         if (config.isClearBeforeApply()) {
-            player.getInventory().clear();
-            player.getEnderChest().clear();
-            player.getInventory().setArmorContents(null);
-            player.getInventory().setItemInOffHand(null);
-            for (PotionEffect effect : new ArrayList<>(player.getActivePotionEffects())) {
-                player.removePotionEffect(effect.getType());
+            if (config.isSyncInventory()) {
+                player.getInventory().clear();
+                player.getInventory().setArmorContents(null);
+                player.getInventory().setItemInOffHand(null);
+            }
+            if (config.isSyncEnderChest()) {
+                player.getEnderChest().clear();
+            }
+            if (config.isSyncPotionEffects()) {
+                for (PotionEffect effect : new ArrayList<>(player.getActivePotionEffects())) {
+                    player.removePotionEffect(effect.getType());
+                }
             }
         }
 
@@ -899,12 +908,17 @@ public class SyncManager {
 
         // Health
         if (config.isSyncHealth()) {
+            double targetMaxHealth = data.getMaxHealth();
             try {
-                player.setMaxHealth(data.getMaxHealth());
+                AttributeInstance maxHealth = player.getAttribute(Attribute.MAX_HEALTH);
+                if (maxHealth != null && data.getMaxHealth() > 0) {
+                    maxHealth.setBaseValue(data.getMaxHealth());
+                    targetMaxHealth = maxHealth.getValue();
+                }
             } catch (Exception ignored) {
-                // Some versions don't support setMaxHealth directly
+                // Attribute may be unavailable on an incompatible server build.
             }
-            double health = Math.min(data.getHealth(), data.getMaxHealth());
+            double health = Math.min(data.getHealth(), targetMaxHealth);
             if (health > 0) {
                 player.setHealth(health);
             }
@@ -1249,10 +1263,10 @@ public class SyncManager {
                     logger.log(Level.SEVERE, "[FinalSave] CRITICAL: failed to spool final save for "
                         + uuid + ". Final state may be lost. Lock will expire naturally.", spoolError);
                 }
-                recordFinalSaveSynchronousFallback(
+                recordFinalSaveQueueFull(
                     "QUIT", uuid,
                     "queue full — spooled to disk for replay." ,
-                    e);
+                    e, false);
                 pendingSaveCount.decrementAndGet();
                 // Do NOT release lock — replay will release it after CAS succeeds.
                 playerVersions.remove(uuid);
@@ -1262,12 +1276,12 @@ public class SyncManager {
                 return;
             }
             // Fallback allowed: run synchronously on the event thread.
-            recordFinalSaveSynchronousFallback(
+            recordFinalSaveQueueFull(
                 "QUIT", uuid,
                 "running synchronously on event thread as last-resort fallback. "
                     + "This blocks the game tick; investigate DB latency or raise "
                     + "database.queue-capacity.",
-                e);
+                e, true);
             saveLock.lock();
             try {
                 refreshVersionAndFencingToken(uuid, data);
@@ -1547,7 +1561,8 @@ public class SyncManager {
             // returns false (e.g. plugin-managed fake death).
             boolean dead = player.isDead() || currentHealth <= 0;
             data.setHealth(dead ? maxHealth : currentHealth);
-            data.setMaxHealth(maxHealth);
+            AttributeInstance maxHealthAttr = player.getAttribute(Attribute.MAX_HEALTH);
+            data.setMaxHealth(maxHealthAttr != null ? maxHealthAttr.getBaseValue() : maxHealth);
         }
         if (config.isSyncFood()) {
             data.setFoodLevel(player.getFoodLevel());
@@ -1828,7 +1843,7 @@ public class SyncManager {
                             ? slotGroupName.getBytes(java.nio.charset.StandardCharsets.UTF_8)
                             : null;
                         modifiers.add(new PlayerData.ModifierData(
-                            mod.getUniqueId().toString(),
+                            mod.getKey().toString(),
                             mod.getName(),
                             mod.getAmount(),
                             mod.getOperation().name(),
@@ -1999,7 +2014,6 @@ public class SyncManager {
                                 // constructor (defaults to ANY).
                                 AttributeModifier modifier = buildAttributeModifier(
                                     modData.getUuid(),
-                                    modData.getName(),
                                     modData.getAmount(),
                                     op,
                                     modData.getSlotGroupName()
@@ -2043,20 +2057,22 @@ public class SyncManager {
      * saved data carries one. Falls back to the 4-arg constructor (ANY slot)
      * for legacy payloads.
      *
-     * <p>Paper 1.21.11 has the 5-arg constructor {@code (UUID, String, double,
-     * Operation, EquipmentSlotGroup)}. We resolve the slot group by name via
-     * {@link org.bukkit.inventory.EquipmentSlotGroup#valueOf(String)} (or its
-     * case-insensitive lookup). On older Paper without the 5-arg constructor,
-     * the NoSuchMethodError is caught and we fall back to 4-arg.
+     * <p>Current Paper identifies modifiers with a {@link NamespacedKey}. Legacy
+     * payloads stored UUID strings; those are mapped into the stable
+     * {@code fastsync:legacy_<uuid>} namespace so they remain loadable.
      */
     private static AttributeModifier buildAttributeModifier(
-            String uuidStr, String name, double amount,
+            String identifier, double amount,
             AttributeModifier.Operation op, String slotGroupName) {
-        java.util.UUID uuid;
-        try {
-            uuid = java.util.UUID.fromString(uuidStr);
-        } catch (IllegalArgumentException e) {
-            return null;
+        if (identifier == null || identifier.isBlank()) return null;
+        NamespacedKey key = NamespacedKey.fromString(identifier);
+        if (key == null) {
+            try {
+                java.util.UUID uuid = java.util.UUID.fromString(identifier);
+                key = new NamespacedKey("fastsync", "legacy_" + uuid.toString().replace('-', '_'));
+            } catch (IllegalArgumentException e) {
+                return null;
+            }
         }
         if (slotGroupName != null && !slotGroupName.isEmpty()) {
             try {
@@ -2065,15 +2081,14 @@ public class SyncManager {
                 org.bukkit.inventory.EquipmentSlotGroup group =
                     org.bukkit.inventory.EquipmentSlotGroup.getByName(slotGroupName);
                 if (group != null) {
-                    return new AttributeModifier(uuid, name, amount, op, group);
+                    return new AttributeModifier(key, amount, op, group);
                 }
-            } catch (NoSuchMethodError | Exception ignored) {
-                // Pre-1.21 Paper does not have the 5-arg constructor or the
-                // getByName method — fall through to the 4-arg constructor.
+            } catch (Exception ignored) {
+                // Invalid slot group: fall through to the ANY-slot constructor.
             }
         }
         try {
-            return new AttributeModifier(uuid, name, amount, op);
+            return new AttributeModifier(key, amount, op);
         } catch (Exception e) {
             return null;
         }
@@ -2275,11 +2290,11 @@ public class SyncManager {
                             // The final-save queue is full, but shutdown cannot
                             // skip saves. Log at SEVERE: this runs DB I/O on the
                             // entity/global thread and blocks the tick loop.
-                            recordFinalSaveSynchronousFallback(
+                            recordFinalSaveQueueFull(
                                 "SHUTDOWN", uuid,
                                 "running synchronously on event thread as fallback. "
                                     + "Investigate DB latency or raise database.queue-capacity.",
-                                e);
+                                e, true);
                             SaveResult result;
                             try {
                                 saveLock.lock();
@@ -2472,10 +2487,7 @@ public class SyncManager {
                 // If it ran after, a player with no event-driven dirty bits
                 // would skip the save entirely and never pick up the
                 // conservative marks until the next validation cycle.
-                dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.PDC);
-                dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.STATISTICS);
-                dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.ATTRIBUTES);
-                dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.ADVANCEMENTS);
+                markComponentsWithoutReliableEvents(uuid);
             }
             // Now check if there's anything to save. After the conservative
             // marks above (when component-storage is on) or markAllDirty (when
@@ -2944,6 +2956,13 @@ public class SyncManager {
         // Log final latency stats before shutdown
         logLatencyStats();
 
+        // Stop disk-spool replay before closing Redis or the database. An
+        // in-flight replay may publish RELEASED after its DB CAS succeeds.
+        if (finalSaveReplayService != null) {
+            finalSaveReplayService.stop();
+            finalSaveReplayService = null;
+        }
+
         // Wait for pending saves first. Timeout is configurable for large
         // servers or slow DBs (default 30s, min 5s).
         long pendingTimeout = config.getShutdownPendingSaveTimeoutMs();
@@ -2977,12 +2996,6 @@ public class SyncManager {
         if (finalSaveExecutor != null) {
             finalSaveExecutor.shutdown(config.getShutdownFinalSaveExecutorTimeoutSeconds());
             finalSaveExecutor = null;
-        }
-
-        // Stop the final-save replay service
-        if (finalSaveReplayService != null) {
-            finalSaveReplayService.stop();
-            finalSaveReplayService = null;
         }
 
         // Round 14: close SnapshotManager's dedicated executor
@@ -3421,6 +3434,31 @@ public class SyncManager {
             case PDC -> config.isSyncPDC();
             case LOCATION -> config.isSyncLocation();
         };
+    }
+
+    /** Mark enabled components whose state can change without a reliable Bukkit event. */
+    private void markComponentsWithoutReliableEvents(UUID uuid) {
+        if (config.isSyncPDC()) {
+            dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.PDC);
+        }
+        if (config.isSyncStatistics()) {
+            dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.STATISTICS);
+        }
+        if (config.isSyncAttributes()) {
+            dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.ATTRIBUTES);
+        }
+        if (config.isSyncAdvancements()) {
+            dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.ADVANCEMENTS);
+        }
+        if (config.isSyncAir()) {
+            dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.AIR);
+        }
+        if (config.isSyncFireTicks()) {
+            dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.FIRE_TICKS);
+        }
+        if (config.isSyncLocation()) {
+            dirtyMask.markDirty(uuid, com.fastsync.sync.dirty.ComponentDirtyMask.Component.LOCATION);
+        }
     }
 
     /**
@@ -4118,12 +4156,16 @@ public class SyncManager {
         }
     }
 
-    private void recordFinalSaveSynchronousFallback(
+    private void recordFinalSaveQueueFull(
             String kind, UUID uuid, String detail,
-            java.util.concurrent.RejectedExecutionException cause) {
+            java.util.concurrent.RejectedExecutionException cause,
+            boolean synchronousFallback) {
         long queueFullCount = finalSaveQueueFullTotal.incrementAndGet();
-        long fallbackCount = finalSaveSyncFallbackTotal.incrementAndGet();
-        finalSaveLastFallbackAt.set(System.currentTimeMillis());
+        long fallbackCount = finalSaveSyncFallbackTotal.get();
+        if (synchronousFallback) {
+            fallbackCount = finalSaveSyncFallbackTotal.incrementAndGet();
+            finalSaveLastFallbackAt.set(System.currentTimeMillis());
+        }
         logger.log(Level.SEVERE, "[FinalSave] Final-save executor rejected " + kind + " save for "
             + uuid + " — " + detail
             + " (queueFullTotal=" + queueFullCount
