@@ -2,6 +2,7 @@ package com.fastsync.database;
 
 import java.sql.SQLException;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -42,48 +43,41 @@ public interface DatabaseBackend {
     LockResult acquireLock(UUID uuid, String serverName, String lockSessionId) throws SQLException;
 
     /**
-     * Load player data (must hold the lock).
-     *
-     * @param uuid the player UUID
-     * @return the loaded data blob, or null if no data exists
-     * @throws SQLException on database error
-     */
-    byte[] loadData(UUID uuid) throws SQLException;
-
-    /**
      * Save player data and release the lock atomically (CAS).
      *
-     * @param uuid          the player UUID
-     * @param data          the serialized+compressed data blob
-     * @param checksum      CRC32 checksum of the raw data
+     * <p>The version is incremented internally ({@code version + 1}).
+     *
+     * @param uuid            the player UUID
+     * @param data            the serialized+compressed data blob
+     * @param checksum        CRC32 checksum of the raw data
      * @param expectedVersion the version expected by the caller (OCC)
-     * @param newVersion    the new version to write
-     * @param fencingToken  the fencing token (must match the lock)
-     * @param serverName    the server name (must match the lock)
-     * @param lockSessionId the lock session ID (must match the lock)
+     * @param fencingToken    the fencing token (must match the lock)
+     * @param serverName      the server name (must match the lock)
+     * @param lockSessionId   the lock session ID (must match the lock)
      * @return true if the CAS succeeded, false if version/fencing mismatch
      * @throws SQLException on database error
      */
     boolean saveDataAndReleaseLockClearComponents(UUID uuid, byte[] data, long checksum,
-        long expectedVersion, long newVersion, long fencingToken,
+        long expectedVersion, long fencingToken,
         String serverName, String lockSessionId) throws SQLException;
 
     /**
      * Save player data while keeping the lock (CAS).
      *
-     * @param uuid          the player UUID
-     * @param data          the serialized+compressed data blob
-     * @param checksum      CRC32 checksum of the raw data
+     * <p>The version is incremented internally ({@code version + 1}).
+     *
+     * @param uuid            the player UUID
+     * @param data            the serialized+compressed data blob
+     * @param checksum        CRC32 checksum of the raw data
      * @param expectedVersion the version expected by the caller (OCC)
-     * @param newVersion    the new version to write
-     * @param fencingToken  the fencing token (must match the lock)
-     * @param serverName    the server name (must match the lock)
-     * @param lockSessionId the lock session ID (must match the lock)
+     * @param fencingToken    the fencing token (must match the lock)
+     * @param serverName      the server name (must match the lock)
+     * @param lockSessionId   the lock session ID (must match the lock)
      * @return true if the CAS succeeded, false if version/fencing mismatch
      * @throws SQLException on database error
      */
     boolean saveDataKeepLockClearComponents(UUID uuid, byte[] data, long checksum,
-        long expectedVersion, long newVersion, long fencingToken,
+        long expectedVersion, long fencingToken,
         String serverName, String lockSessionId) throws SQLException;
 
     /**
@@ -115,13 +109,16 @@ public interface DatabaseBackend {
     /**
      * Batch refresh locks for multiple players (single round-trip).
      *
-     * @param playersToRefresh map of UUID → fencing token
-     * @param serverName       the server holding the locks
-     * @param lockSessionId    the lock session ID
+     * @param playersToRefresh   map of UUID to fencing token
+     * @param playerLockSessions map of UUID to lock session ID
+     * @param serverName         the server holding the locks
+     * @param failedPlayers      output set - UUIDs whose refresh failed (0 rows updated)
      * @throws SQLException on database error
      */
+    @SuppressWarnings("unused")
     void refreshLockBatch(Map<UUID, Long> playersToRefresh,
-        String serverName, String lockSessionId) throws SQLException;
+        Map<UUID, String> playerLockSessions,
+        String serverName, Set<UUID> failedPlayers) throws SQLException;
 
     /**
      * Check if the database connection is healthy.

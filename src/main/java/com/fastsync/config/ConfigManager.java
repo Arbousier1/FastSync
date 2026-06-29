@@ -213,7 +213,6 @@ public class ConfigManager {
         this.logger = Logger.getLogger("FastSync");
     }
 
-    private static final int CURRENT_CONFIG_VERSION = 2;
 
     public void load() {
         // Copy config.yml from the JAR if it does not already exist (Bukkit handles this)
@@ -234,10 +233,7 @@ public class ConfigManager {
         }
 
         // Config version migration — handle renamed/removed/added keys
-        int configVersion = loaded.getInt("config_version", 1);
-        if (configVersion < CURRENT_CONFIG_VERSION) {
-            migrateConfig(loaded, configVersion, configFile);
-        }
+        new ConfigMigrator(plugin).checkAndMigrate(configFile);
 
         this.doc = loaded;
 
@@ -247,50 +243,6 @@ public class ConfigManager {
     public void reload() {
         // Re-read the config file (sparrow-yaml re-parses it inside load())
         load();
-    }
-
-    /**
-     * Migrate config from old version to current version.
-     * Handles renamed/removed/added keys between versions.
-     *
-     * @param doc           the loaded YAML document
-     * @param fromVersion   the current config version in the file
-     * @param configFile    the config file path (for saving)
-     */
-    private void migrateConfig(YamlDocument doc, int fromVersion, File configFile) {
-        plugin.getLogger().info("[Config] Migrating config from v" + fromVersion
-            + " to v" + CURRENT_CONFIG_VERSION);
-        SparrowConfigSource src = new SparrowConfigSource(doc);
-
-        // v1 → v2: Added config_version, language, zstd-level, compression type update
-        if (fromVersion < 2) {
-            // Ensure language key exists
-            if (src.getString("language", "").isEmpty()) {
-                doc.set("en", (Object) new String[]{"language"});
-            }
-            // Ensure compression.zstd-level exists
-            if (src.getInt("compression.zstd-level", -1) == -1) {
-                doc.set(3, (Object) new Object[]{"compression", "zstd-level"});
-            }
-            // Ensure compression.type has a value
-            String compType = src.getString("compression.type", "");
-            if (compType.isEmpty()) {
-                doc.set("LZ4", (Object) new String[]{"compression", "type"});
-            }
-        }
-
-        // Update config version
-        doc.set(CURRENT_CONFIG_VERSION, (Object) new String[]{"config_version"});
-
-        // Save migrated config
-        try {
-            doc.save(configFile);
-            plugin.getLogger().info("[Config] Migration to v" + CURRENT_CONFIG_VERSION
-                + " completed successfully.");
-        } catch (IOException e) {
-            plugin.getLogger().warning("[Config] Failed to save migrated config: "
-                + e.getMessage() + " — using in-memory values.");
-        }
     }
 
     /**
