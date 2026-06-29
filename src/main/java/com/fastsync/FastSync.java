@@ -331,7 +331,7 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                 saveConfig();
                 configManager.reload();
                 sender.sendMessage(msg.component("command.debug.toggled",
-                    newDebug ? "&aON" : "&cOFF"));
+                    newDebug ? "<green>ON" : "<red>OFF"));
             }
             case "saveall" -> {
                 sender.sendMessage(msg.component("command.saveall.saving"));
@@ -417,11 +417,11 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                         components.add(msg.component("command.log.header", args[1], logs.size()));
                         for (OperationLog log : logs) {
                             String typeColor = switch (log.type()) {
-                                case CONFLICT, CHECKSUM_FAIL, LOCK_EXPIRE -> "&c";
-                                case SAVE, SNAPSHOT, RESTORE -> "&a";
-                                case LOAD, LOCK_ACQUIRE, LOCK_RELEASE -> "&b";
+                                case CONFLICT, CHECKSUM_FAIL, LOCK_EXPIRE -> "<red>";
+                                case SAVE, SNAPSHOT, RESTORE -> "<green>";
+                                case LOAD, LOCK_ACQUIRE, LOCK_RELEASE -> "<aqua>";
                             };
-                            String detail = log.detail() != null ? " | &f" + log.detail() : "";
+                            String detail = log.detail() != null ? " | <white>" + log.detail() : "";
                             components.add(msg.component("command.log.entry",
                                 log.seq(), typeColor + log.type(), log.serverName(),
                                 log.version(), log.fencingToken(), log.dataSize(), detail));
@@ -493,8 +493,8 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
             syncManager.getAsyncActiveCount(), syncManager.getAsyncQueueSize()));
         sender.sendMessage(msg.component("command.status.login-load-budget",
             syncManager.getLoginLoadAvailablePermits(), syncManager.getLoginLoadLimit()));
-        String finalSaveColor = syncManager.hasFinalSaveAlert() ? "&c"
-            : (syncManager.hasFinalSaveWarning() ? "&e" : "&a");
+        String finalSaveColor = syncManager.hasFinalSaveAlert() ? "<red>"
+            : (syncManager.hasFinalSaveWarning() ? "<yellow>" : "<green>");
         sender.sendMessage(msg.component("command.status.final-save-executor",
             finalSaveColor,
             syncManager.getFinalSaveActiveCount(),
@@ -513,7 +513,7 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         long spoolPending = syncManager.getFinalSaveSpoolPendingCount();
         long spoolFailed = syncManager.getFinalSaveSpoolFailedCount();
         if (spoolPending > 0 || spoolFailed > 0 || configManager.isFinalSaveSpoolEnabled()) {
-            String spoolColor = spoolFailed > 0 ? "&c" : (spoolPending > 0 ? "&e" : "&a");
+            String spoolColor = spoolFailed > 0 ? "<red>" : (spoolPending > 0 ? "<yellow>" : "<green>");
             sender.sendMessage(msg.component("command.status.final-save-spool-disk",
                 spoolColor, spoolPending, spoolFailed, syncManager.getFinalSaveSpoolBytes()));
             long lastReplay = syncManager.getFinalSaveSpoolLastReplayAt();
@@ -542,7 +542,7 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         }
         if (configManager.isOperationLogEnabled()) {
             long dropped = syncManager.getOperationLogDroppedTotal();
-            String opLogColor = dropped > 0 ? "&c" : "&a";
+            String opLogColor = dropped > 0 ? "<red>" : "<green>";
             sender.sendMessage(msg.component("command.status.oplog",
                 opLogColor,
                 syncManager.getOperationLogQueueSize(), syncManager.getOperationLogQueueCapacity(),
@@ -584,7 +584,7 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         if (syncManager.getSnapshotManager() != null) {
             var sm = syncManager.getSnapshotManager();
             long rejected = sm.getRejectedCount();
-            String snapColor = rejected > 0 ? "&c" : "&a";
+            String snapColor = rejected > 0 ? "<red>" : "<green>";
             sender.sendMessage(msg.component("command.status.snapshots",
                 snapColor, sm.getQueueSize(), sm.getQueueCapacity(), rejected));
         }

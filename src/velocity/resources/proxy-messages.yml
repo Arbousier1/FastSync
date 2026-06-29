@@ -2,47 +2,48 @@
 # FastSync Proxy Messages
 # ============================================================
 # Messages for the Velocity proxy plugin.
-# Use & color codes (e.g. &c for red, &a for green, &6 for gold)
+# Uses MiniMessage formatting: <red>, <green>, <yellow>, <gray>, <gold>, <aqua>, <white>
 # Placeholders: {0}, {1}, {2}, ...
+# Docs: https://docs.advntr.dev/minimessage/format.html
 # ============================================================
 
 # ==================== /fastsync command help ====================
 proxy:
   command:
-    header: "&6FastSync Proxy Commands:"
-    status: "&e  /fastsync status  - Show aggregated backend status"
-    players: "&e  /fastsync players - Show player to server mapping"
-    reload: "&e  /fastsync reload  - Reload proxy config"
-    debug: "&e  /fastsync debug   - Toggle debug mode"
+    header: "<gold>FastSync Proxy Commands:"
+    status: "<yellow>  /fastsync status  - Show aggregated backend status"
+    players: "<yellow>  /fastsync players - Show player to server mapping"
+    reload: "<yellow>  /fastsync reload  - Reload proxy config"
+    debug: "<yellow>  /fastsync debug   - Toggle debug mode"
 
   # ==================== /fastsync status ====================
   status:
-    querying: "&eQuerying backend servers..."
-    no-backends: "&cNo backends responded."
-    header: "&6===== FastSync Proxy Status ====="
+    querying: "<yellow>Querying backend servers..."
+    no-backends: "<red>No backends responded."
+    header: "<gold>===== FastSync Proxy Status ====="
     # {0}=serverName  {1}=dbStatus  {2}=redisStatus  {3}=players  {4}=pendingSaves  {5}=pendingLoads
-    backend: "&b  {0} &7| DB: {1}&7 | Redis: {2}&7 | Players: &f{3}&7 | Save: &f{4}&7 | Load: &f{5}"
-    total-players: "&7Total players on proxy: {0}"
-    query-failed: "&cFailed to query backends: {0}"
+    backend: "<aqua>  {0} <gray>| DB: {1}<gray> | Redis: {2}<gray> | Players: <white>{3}<gray> | Save: <white>{4}<gray> | Load: <white>{5}"
+    total-players: "<gray>Total players on proxy: {0}"
+    query-failed: "<red>Failed to query backends: {0}"
 
   # ==================== /fastsync players ====================
   players:
-    none: "&eNo tracked players."
-    header: "&6===== Tracked Players ====="
+    none: "<yellow>No tracked players."
+    header: "<gold>===== Tracked Players ====="
     # {0}=playerName  {1}=serverName
-    entry: "&b  {0}&e -> {1}"
-    total: "&7Total: {0} players"
+    entry: "<aqua>  {0}<yellow> -> {1}"
+    total: "<gray>Total: {0} players"
 
   # ==================== /fastsync reload ====================
   reload:
-    success: "&aFastSync proxy config reloaded."
+    success: "<green>FastSync proxy config reloaded."
 
   # ==================== /fastsync debug ====================
   debug:
-    state: "&eDebug mode: {0}"
-    hint: "&7(Edit proxy-config.yml and run /fastsync reload to change)"
+    state: "<yellow>Debug mode: {0}"
+    hint: "<gray>(Edit proxy-config.yml and run /fastsync reload to change)"
 
   # ==================== Handoff messages ====================
   handoff:
-    waiting: "&e[FastSync] Waiting for your data to be saved..."
-    timeout: "&c[FastSync] Data save timed out, transferring anyway."
+    waiting: "<yellow>[FastSync] Waiting for your data to be saved..."
+    timeout: "<red>[FastSync] Data save timed out, transferring anyway."

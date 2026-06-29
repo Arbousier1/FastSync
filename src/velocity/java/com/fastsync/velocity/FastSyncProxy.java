@@ -18,7 +18,7 @@ import com.velocitypowered.api.proxy.messages.ChannelIdentifier;
 import com.velocitypowered.api.proxy.messages.MinecraftChannelIdentifier;
 import com.velocitypowered.api.proxy.server.RegisteredServer;
 import net.kyori.adventure.text.Component;
-import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
+import net.kyori.adventure.text.minimessage.MiniMessage;
 import org.slf4j.Logger;
 import org.yaml.snakeyaml.Yaml;
 
@@ -361,7 +361,7 @@ public class FastSyncProxy {
                 template = template.replace("{" + i + "}", String.valueOf(args[i]));
             }
         }
-        return LegacyComponentSerializer.legacyAmpersand().deserialize(template);
+        return MiniMessage.miniMessage().deserialize(template);
     }
 
     /**

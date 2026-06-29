@@ -1,7 +1,8 @@
 package com.fastsync.i18n;
 
 import net.kyori.adventure.text.Component;
-import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
+import net.kyori.adventure.text.minimessage.MiniMessage;
+import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.plugin.java.JavaPlugin;
 
@@ -27,9 +28,12 @@ import java.util.logging.Logger;
  * Keys use dot notation, e.g. {@code command.reload.success}.
  * Placeholders use {@code {0}}, {@code {1}} style (0-indexed).
  *
- * <h2>Color codes</h2>
- * Messages use {@code &} legacy color codes (e.g. {@code &c} for red).
- * These are parsed by {@link LegacyComponentSerializer#legacyAmpersand()}.
+ * <h2>Formatting</h2>
+ * Messages use <a href="https://docs.advntr.dev/minimessage/format.html">
+ * MiniMessage</a> tags for formatting, e.g. {@code <red>},
+ * {@code <green>}, {@code <bold>}, {@code <click:run_command:/fsync status>}.
+ * This is the modern Adventure API standard, replacing legacy {@code &}
+ * color codes.
  *
  * <h2>Usage</h2>
  * <pre>{@code
@@ -40,14 +44,15 @@ import java.util.logging.Logger;
  * sender.sendMessage(msg.component("command.saveall.result",
  *     result.success(), result.total(), result.failed()));
  *
- * // Console log (returns String, no color codes)
+ * // Console log (returns String, no formatting)
  * logger.info(msg.console("console.startup.enabled"));
  * }</pre>
  */
 public class MessageManager {
 
-    private static final LegacyComponentSerializer SERIALIZER =
-        LegacyComponentSerializer.legacyAmpersand();
+    private static final MiniMessage MINI_MESSAGE = MiniMessage.miniMessage();
+    private static final PlainTextComponentSerializer PLAIN_SERIALIZER =
+        PlainTextComponentSerializer.plainText();
 
     private final Map<String, String> messages = new ConcurrentHashMap<>();
     private final Logger logger;
@@ -101,28 +106,29 @@ public class MessageManager {
 
     /**
      * Get a message as an Adventure Component (for player-facing messages).
-     * Parses {@code &} color codes.
+     * Parses MiniMessage tags (e.g. {@code <red>}, {@code <bold>}).
      *
      * @param key  the message key
      * @param args placeholder values
      * @return the deserialized Component
      */
     public Component component(String key, Object... args) {
-        return SERIALIZER.deserialize(raw(key, args));
+        return MINI_MESSAGE.deserialize(raw(key, args));
     }
 
     /**
-     * Get a console-formatted message string (no color codes).
-     * Strips {@code &} color codes for clean console output.
+     * Get a console-formatted message string (plain text, no formatting).
+     * Strips all MiniMessage tags for clean console output.
      *
      * @param key  the message key
      * @param args placeholder values
-     * @return the formatted string with color codes stripped
+     * @return the formatted plain text string
      */
     public String console(String key, Object... args) {
         String text = raw(key, args);
-        // Strip & color codes for console
-        return text.replaceAll("&[0-9a-fk-orA-FK-OR]", "");
+        // Parse and serialize to plain text to strip all MiniMessage tags
+        Component component = MINI_MESSAGE.deserialize(text);
+        return PLAIN_SERIALIZER.serialize(component);
     }
 
     /**
@@ -241,8 +247,6 @@ public class MessageManager {
         for (int i = 0; i < args.length; i++) {
             String placeholder = "{" + i + "}";
             String replacement = args[i] == null ? "null" : String.valueOf(args[i]);
-            // Escape backslashes and dollar signs to prevent regex issues
-            replacement = replacement.replace("\\", "\\\\").replace("$", "\\$");
             result = result.replace("{" + i + "}", replacement);
         }
         return result;
