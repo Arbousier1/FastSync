@@ -240,6 +240,17 @@ public class CompressionUtil {
                 + " (expected " + FORMAT_VERSION + " or " + FORMAT_VERSION_LEGACY + ")");
         }
 
+        // Validate that only known flag bits are set.
+        // v2 allows: FLAG_COMPRESSED (0x01) + FLAG_ALGORITHM_MASK (0x06) = 0x07
+        // v1 (legacy) only allows FLAG_COMPRESSED (0x01)
+        byte allowedFlags = (version == FORMAT_VERSION_LEGACY)
+            ? FLAG_COMPRESSED
+            : (byte) (FLAG_COMPRESSED | FLAG_ALGORITHM_MASK);
+        if ((flags & ~allowedFlags) != 0) {
+            throw new CorruptDataException("Unsupported compression flags: 0x"
+                + Integer.toHexString(flags & 0xFF));
+        }
+
         boolean compressed = (flags & FLAG_COMPRESSED) != 0;
 
         if (compressed) {

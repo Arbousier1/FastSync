@@ -260,6 +260,12 @@ public class FinalSaveReplayService {
                         spool.moveToFailed(file, reason);
                         failed++;
                     }
+                    // Invalidate the cache so the next replay batch for this
+                    // UUID gets a fresh lock-state read. Without this, a
+                    // same-fencing retry would see the stale cached version
+                    // (which equals the rewritten expectedVersion) and
+                    // misclassify as VERSION_NOT_ADVANCED.
+                    lockStateCache.invalidate(rec.uuid());
                 }
             } catch (Exception e) {
                 logger.log(Level.WARNING, "[FinalSaveReplay] Failed to process spool file " + file, e);
