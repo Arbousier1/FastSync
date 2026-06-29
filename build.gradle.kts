@@ -282,6 +282,7 @@ tasks.shadowJar {
                 && !group.startsWith("at.yawk")
                 && !group.startsWith("org.jooq")
                 && !group.startsWith("com.github.ben-manes")
+                && !group.startsWith("com.github.luben")
                 && !group.startsWith("io.r2dbc")
         }
     }
