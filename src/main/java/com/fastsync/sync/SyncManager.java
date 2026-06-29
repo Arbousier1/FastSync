@@ -691,7 +691,7 @@ public class SyncManager {
                     ". Rejecting load to prevent applying corrupted data.");
 
                 // Log checksum failure
-                logOperation(uuid, OperationType.CHECKSUM_FAIL, fencingToken, loaded.version(),
+                operationLogDelegate.logOperation(uuid, OperationType.CHECKSUM_FAIL, fencingToken, loaded.version(),
                     decompressed != null ? decompressed.length : 0,
                     "Checksum mismatch: stored=" + loaded.checksum());
 
@@ -3587,7 +3587,7 @@ public class SyncManager {
             }
 
             // Log operation
-            logOperation(uuid, OperationType.SAVE, data.getFencingToken(),
+            operationLogDelegate.logOperation(uuid, OperationType.SAVE, data.getFencingToken(),
                 batchResult.newVersion(), totalCompressedSize,
                 "Component save " + kind + " (" + componentWrites.size() + " components, gen=" + batchResult.generation() + ")");
 
