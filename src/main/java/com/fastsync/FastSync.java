@@ -2,12 +2,12 @@ package com.fastsync;
 
 import com.fastsync.config.ConfigManager;
 import com.fastsync.database.DatabaseManager;
+import com.fastsync.i18n.MessageManager;
 import com.fastsync.listeners.PlayerListener;
 import com.fastsync.log.OperationLog;
 import com.fastsync.sync.SyncManager;
 import com.fastsync.util.SchedulerUtil;
 import org.bukkit.Bukkit;
-import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
@@ -44,20 +44,6 @@ import java.util.logging.Level;
  */
 public class FastSync extends JavaPlugin implements CommandExecutor, TabCompleter, Listener {
 
-    private static final LegacyComponentSerializer MESSAGE_SERIALIZER =
-        LegacyComponentSerializer.legacySection();
-    private static final String RED = "\u00a7c";
-    private static final String GREEN = "\u00a7a";
-    private static final String YELLOW = "\u00a7e";
-    private static final String GRAY = "\u00a77";
-    private static final String GOLD = "\u00a76";
-    private static final String AQUA = "\u00a7b";
-    private static final String WHITE = "\u00a7f";
-
-    private static void sendMessage(CommandSender sender, String message) {
-        sender.sendMessage(MESSAGE_SERIALIZER.deserialize(message));
-    }
-
     private static String formatTime(long epochMillis) {
         return epochMillis > 0 ? new java.util.Date(epochMillis).toString() : "never";
     }
@@ -65,10 +51,12 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
     private ConfigManager configManager;
     private DatabaseManager databaseManager;
     private SyncManager syncManager;
+    private MessageManager msg;
 
     private static FastSync instance;
 
     public static FastSync getInstance() { return instance; }
+    public MessageManager getMessageManager() { return msg; }
 
     private Object cleanupTask;
     private Object periodicSaveTask;
@@ -96,9 +84,8 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         heartbeatTask = SchedulerUtil.runAsyncTimer(this, () -> {
             syncManager.heartbeatOnlinePlayers();
         }, heartbeatTicks, heartbeatTicks);
-        getLogger().info("Lock heartbeat " + (heartbeatTask != null ? "restarted" : "started")
-            + ": every " + configManager.getHeartbeatIntervalSeconds() + " seconds"
-            + " (lock-timeout=" + configManager.getLockTimeout() + "s).");
+        getLogger().info(msg.console("console.startup.heartbeat-restarted",
+            configManager.getHeartbeatIntervalSeconds(), configManager.getLockTimeout()));
     }
 
     @Override
@@ -113,10 +100,13 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
             // Clean-slate: config parse failure is a hard error (no Bukkit
             // fallback). Fail startup explicitly rather than letting the
             // RuntimeException propagate into Bukkit's loader.
-            getLogger().log(Level.SEVERE, "Failed to load config.yml — refusing to start: " + e.getMessage(), e);
+            getLogger().log(Level.SEVERE, "Failed to load config.yml, refusing to start: " + e.getMessage(), e);
             getServer().getPluginManager().disablePlugin(this);
             return;
         }
+
+        // Initialize i18n message manager
+        msg = new MessageManager(this, getLogger(), configManager.getLanguage());
 
         // Validate insecure default configuration before touching the DB.
         // Clean-slate: the bundled config ships sample (root/password,
@@ -135,7 +125,7 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         try {
             databaseManager.initialize();
         } catch (SQLException e) {
-            getLogger().log(Level.SEVERE, "Failed to initialize database! Check your config.yml.", e);
+            getLogger().log(Level.SEVERE, msg.console("console.config.db-init-failed"), e);
             getServer().getPluginManager().disablePlugin(this);
             return;
         }
@@ -153,7 +143,7 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                 this, configManager, databaseManager, syncManager));
         Bukkit.getMessenger().registerOutgoingPluginChannel(
             this, com.fastsync.messaging.HandoffMessageListener.CHANNEL);
-        getLogger().info("Registered fastsync:handoff plugin messaging channel (optional: for Velocity proxy integration)");
+        getLogger().info(msg.console("console.startup.handoff-channel"));
 
         // Register listeners
         getServer().getPluginManager().registerEvents(this, this);
@@ -166,8 +156,8 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         if (configManager.isDirtyTrackingEnabled() && syncManager.getDirtyMask() != null) {
             getServer().getPluginManager().registerEvents(
                 new com.fastsync.listeners.dirty.DirtyTrackingListener(syncManager.getDirtyMask()), this);
-            getLogger().info("Dirty tracking enabled: validation every " +
-                configManager.getDirtyValidationInterval() + " saves");
+            getLogger().info(msg.console("console.startup.dirty-tracking",
+                configManager.getDirtyValidationInterval()));
         }
 
         // Register command
@@ -217,15 +207,17 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                     }, delayTicks);
                 }
             }, intervalTicks, intervalTicks);
-            getLogger().info("Periodic save enabled: every " +
-                configManager.getPeriodicSaveIntervalSeconds() + " seconds");
+            getLogger().info(msg.console("console.startup.periodic-save",
+                configManager.getPeriodicSaveIntervalSeconds()));
         }
 
-        getLogger().info("FastSync v" + getPluginMeta().getVersion() + " enabled!");
-        getLogger().info("Server ID: " + configManager.getServerName());
-        getLogger().info("Serialization: Paper native ItemStack byte serialization");
-        getLogger().info("Compression: " + (configManager.isCompressionEnabled() ? "LZ4" : "Disabled"));
-        getLogger().info("Redis: " + (configManager.isRedisEnabled() ? "Enabled" : "Disabled (DB polling)"));
+        getLogger().info(msg.console("console.startup.enabled", getPluginMeta().getVersion()));
+        getLogger().info(msg.console("console.startup.server-id", configManager.getServerName()));
+        getLogger().info(msg.console("console.startup.serialization"));
+        getLogger().info(msg.console("console.startup.compression",
+            configManager.isCompressionEnabled() ? "LZ4" : "Disabled"));
+        getLogger().info(msg.console("console.startup.redis",
+            configManager.isRedisEnabled() ? "Enabled" : "Disabled (DB polling)"));
     }
 
     @Override
@@ -245,7 +237,7 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
             databaseManager.close();
         }
 
-        getLogger().info("FastSync disabled!");
+        getLogger().info(msg.console("console.shutdown.disabled"));
         instance = null;
     }
 
@@ -273,11 +265,12 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         SchedulerUtil.cancel(periodicSaveTask);
         SchedulerUtil.cancel(heartbeatTask);
 
-        getLogger().info("Saving all online players (shutdown)...");
+        getLogger().info(msg.console("console.shutdown.saving"));
         SyncManager.SaveAllResult result =
             syncManager.saveAllOnlinePlayers(SyncManager.SaveKind.SHUTDOWN);
-        getLogger().info("Shutdown save: " + result.success() + "/" + result.total()
-            + " succeeded" + (result.failed() > 0 ? ", " + result.failed() + " failed" : "") + ".");
+        getLogger().info(msg.console("console.shutdown.save-result",
+            result.success(), result.total(),
+            result.failed() > 0 ? ", " + result.failed() + " failed" : ""));
     }
 
     // ==================== Command Handler ====================
@@ -286,7 +279,7 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
     public boolean onCommand(@NotNull CommandSender sender, @NotNull Command command,
                              @NotNull String label, @NotNull String[] args) {
         if (!sender.hasPermission("fastsync.admin")) {
-            sendMessage(sender, RED + "You don't have permission to use this command.");
+            sender.sendMessage(msg.component("command.no-permission"));
             return true;
         }
 
@@ -298,32 +291,33 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
         switch (args[0].toLowerCase()) {
             case "reload" -> {
                 configManager.reload();
+                msg.reload(this);
                 // Refresh SyncManager caches that depend on config (e.g. snapshot trigger set)
                 if (syncManager != null) {
                     syncManager.refreshConfigCache();
                 }
                 // Restart heartbeat task — interval may have changed
                 restartHeartbeatTask();
-                sendMessage(sender, GREEN + "[FastSync] Configuration reloaded.");
-                sendMessage(sender, GRAY + "Server: " + configManager.getServerName());
-                sendMessage(sender, GRAY + "Compression: " +
-                    (configManager.isCompressionEnabled() ? "LZ4" : "Disabled"));
-                sendMessage(sender, GRAY + "Redis: " +
-                    (configManager.isRedisEnabled() ? "Enabled" : "Disabled"));
-                sendMessage(sender, GRAY + "Heartbeat: every " +
-                    configManager.getHeartbeatIntervalSeconds() + "s (timer restarted)");
+                sender.sendMessage(msg.component("command.reload.success"));
+                sender.sendMessage(msg.component("command.reload.server", configManager.getServerName()));
+                sender.sendMessage(msg.component("command.reload.compression",
+                    configManager.isCompressionEnabled() ? "LZ4" : "Disabled"));
+                sender.sendMessage(msg.component("command.reload.redis",
+                    configManager.isRedisEnabled() ? "Enabled" : "Disabled"));
+                sender.sendMessage(msg.component("command.reload.heartbeat",
+                    configManager.getHeartbeatIntervalSeconds()));
                 // The health probe borrows a JDBC connection and may wait up to
                 // connection-timeout. Never perform it on a Paper/Folia tick.
                 SchedulerUtil.runAsync(this, () -> {
                     boolean resetOk = syncManager.resetProtectionMode();
-                    runForSender(sender, () -> sendMessage(sender,
+                    runForSender(sender, () -> sender.sendMessage(
                         resetOk
-                            ? GREEN + "[FastSync] Protection mode reset."
-                            : RED + "[FastSync] Protection mode still active: database is unhealthy."));
+                            ? msg.component("command.reload.protection-reset")
+                            : msg.component("command.reload.protection-active")));
                 });
             }
             case "status" -> {
-                sendMessage(sender, YELLOW + "[FastSync] Checking backend health...");
+                sender.sendMessage(msg.component("command.status.checking"));
                 SchedulerUtil.runAsync(this, () -> {
                     boolean databaseHealthy = databaseManager.isHealthy();
                     boolean redisHealthy = syncManager.isRedisHealthy();
@@ -336,11 +330,11 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                 getConfig().set("debug", newDebug);
                 saveConfig();
                 configManager.reload();
-                sendMessage(sender, GREEN + "[FastSync] Debug mode: " +
-                    (newDebug ? GREEN + "ON" : RED + "OFF"));
+                sender.sendMessage(msg.component("command.debug.toggled",
+                    newDebug ? "&aON" : "&cOFF"));
             }
             case "saveall" -> {
-                sendMessage(sender, YELLOW + "[FastSync] Saving all online players...");
+                sender.sendMessage(msg.component("command.saveall.saving"));
                 // CRITICAL (Folia-safety): the save flow is split into two phases:
                 //
                 //   Phase 1 (dispatch) — runs on the global region. Captures the
@@ -364,21 +358,21 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                             SyncManager.SaveAllResult result = syncManager.waitForPlayerSaves(futures, SyncManager.SaveKind.BULK);
                             SchedulerUtil.runGlobal(this, () -> {
                                 if (result.allSucceeded()) {
-                                    sendMessage(sender, GREEN + "[FastSync] All " + result.total() + " players saved!");
+                                    sender.sendMessage(msg.component("command.saveall.all-saved", result.total()));
                                 } else {
-                                    sendMessage(sender, YELLOW + "[FastSync] Saved " + result.success()
-                                        + "/" + result.total() + " players. " + RED + result.failed() + " failed.");
+                                    sender.sendMessage(msg.component("command.saveall.partial",
+                                        result.success(), result.total(), result.failed()));
                                     if (!result.failures().isEmpty()) {
-                                        sendMessage(sender, GRAY + "Failed players:");
+                                        sender.sendMessage(msg.component("command.saveall.failed-players"));
                                         result.failures().forEach((uuid, reason) ->
-                                            sendMessage(sender, GRAY + "  " + uuid + ": " + RED + reason));
+                                            sender.sendMessage(msg.component("command.saveall.failed-player", uuid, reason)));
                                     }
                                 }
                             });
                         } catch (Exception e) {
-                            getLogger().log(Level.SEVERE, "Saveall failed", e);
+                            getLogger().log(Level.SEVERE, msg.console("console.saveall.failed"), e);
                             SchedulerUtil.runGlobal(this, () ->
-                                sendMessage(sender, RED + "[FastSync] Saveall failed: " + e.getMessage())
+                                sender.sendMessage(msg.component("command.saveall.error", e.getMessage()))
                             );
                         }
                     });
@@ -386,7 +380,7 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
             }
             case "log" -> {
                 if (args.length < 2) {
-                    sendMessage(sender, RED + "Usage: /" + label + " log <player|uuid> [limit]");
+                    sender.sendMessage(msg.component("command.log.usage", label));
                     return true;
                 }
                 int limit;
@@ -394,7 +388,7 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                     try {
                         limit = Math.min(Integer.parseInt(args[2]), 50);
                     } catch (NumberFormatException e) {
-                        sendMessage(sender, RED + "Invalid number: " + args[2]);
+                        sender.sendMessage(msg.component("command.log.invalid-number", args[2]));
                         return true;
                     }
                 } else {
@@ -408,7 +402,7 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                     try {
                         targetUuid = UUID.fromString(args[1]);
                     } catch (IllegalArgumentException e) {
-                        sendMessage(sender, RED + "Player not found or invalid UUID: " + args[1]);
+                        sender.sendMessage(msg.component("command.log.player-not-found", args[1]));
                         return true;
                     }
                 }
@@ -416,28 +410,26 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
                 SchedulerUtil.runAsync(this, () -> {
                     List<OperationLog> logs = syncManager.queryOperationLog(fuuid, limit);
                     // Build all messages on async thread, then send on global thread
-                    List<String> messages = new java.util.ArrayList<>();
+                    List<net.kyori.adventure.text.Component> components = new java.util.ArrayList<>();
                     if (logs.isEmpty()) {
-                        messages.add(YELLOW + "[FastSync] No operation log entries for " + args[1]);
+                        components.add(msg.component("command.log.no-entries", args[1]));
                     } else {
-                        messages.add(GOLD + "===== Operation Log: " + args[1] + " (" + logs.size() + " entries) =====");
+                        components.add(msg.component("command.log.header", args[1], logs.size()));
                         for (OperationLog log : logs) {
                             String typeColor = switch (log.type()) {
-                                case CONFLICT, CHECKSUM_FAIL, LOCK_EXPIRE -> RED;
-                                case SAVE, SNAPSHOT, RESTORE -> GREEN;
-                                case LOAD, LOCK_ACQUIRE, LOCK_RELEASE -> AQUA;
+                                case CONFLICT, CHECKSUM_FAIL, LOCK_EXPIRE -> "&c";
+                                case SAVE, SNAPSHOT, RESTORE -> "&a";
+                                case LOAD, LOCK_ACQUIRE, LOCK_RELEASE -> "&b";
                             };
-                            messages.add(GRAY + "#" + log.seq() + " " +
-                                typeColor + log.type() + GRAY +
-                                " | server=" + log.serverName() +
-                                " v=" + log.version() + " ft=" + log.fencingToken() +
-                                " sz=" + log.dataSize() + "B" +
-                                (log.detail() != null ? " | " + WHITE + log.detail() : ""));
+                            String detail = log.detail() != null ? " | &f" + log.detail() : "";
+                            components.add(msg.component("command.log.entry",
+                                log.seq(), typeColor + log.type(), log.serverName(),
+                                log.version(), log.fencingToken(), log.dataSize(), detail));
                         }
                     }
                     SchedulerUtil.runGlobal(this, () -> {
-                        for (String msg : messages) {
-                            sendMessage(sender, msg);
+                        for (net.kyori.adventure.text.Component c : components) {
+                            sender.sendMessage(c);
                         }
                     });
                 });
@@ -464,160 +456,150 @@ public class FastSync extends JavaPlugin implements CommandExecutor, TabComplete
     }
 
     private void sendHelp(CommandSender sender, String label) {
-        sendMessage(sender, GOLD + "===== FastSync =====");
-        sendMessage(sender, YELLOW + "/" + label + " reload " + GRAY + "- Reload configuration");
-        sendMessage(sender, YELLOW + "/" + label + " status " + GRAY + "- Show plugin status");
-        sendMessage(sender, YELLOW + "/" + label + " debug " + GRAY + "- Toggle debug mode");
-        sendMessage(sender, YELLOW + "/" + label + " saveall " + GRAY + "- Save all online players");
-        sendMessage(sender, YELLOW + "/" + label + " log <player> [n] " + GRAY + "- View operation log for a player");
+        sender.sendMessage(msg.component("command.help.header"));
+        sender.sendMessage(msg.component("command.help.reload", label));
+        sender.sendMessage(msg.component("command.help.status", label));
+        sender.sendMessage(msg.component("command.help.debug", label));
+        sender.sendMessage(msg.component("command.help.saveall", label));
+        sender.sendMessage(msg.component("command.help.log", label));
     }
 
     private void runForSender(CommandSender sender, Runnable task) {
         if (sender instanceof Player player) {
             SchedulerUtil.runAtEntity(this, player, task,
-                () -> getLogger().fine("Command sender retired before response could be sent"));
+                () -> getLogger().fine(msg.console("console.sender-retired")));
         } else {
             SchedulerUtil.runGlobal(this, task);
         }
     }
 
     private void sendStatus(CommandSender sender, boolean databaseHealthy, boolean redisHealthy) {
-        sendMessage(sender, GOLD + "===== FastSync Status =====");
-        sendMessage(sender, YELLOW + "Server: " + WHITE + configManager.getServerName());
-        sendMessage(sender, YELLOW + "Database: " +
-            (databaseHealthy ? GREEN + "Connected" : RED + "Disconnected"));
-        sendMessage(sender, YELLOW + "Redis: " +
-            (redisHealthy ? GREEN + "Connected" :
-             (configManager.isRedisEnabled() ? RED + "Failed" : GRAY + "Disabled")));
-        sendMessage(sender, YELLOW + "Serialization: " + WHITE +
-            "Paper native ItemStack byte serialization");
-        sendMessage(sender, YELLOW + "Active players: " + WHITE + syncManager.getActiveCount());
-        sendMessage(sender, YELLOW + "Pending loads: " + WHITE + syncManager.getPendingCount());
-        sendMessage(sender, YELLOW + "Pending saves: " + WHITE + syncManager.getPendingSaveCount());
-        sendMessage(sender, YELLOW + "Quarantined: " + WHITE + syncManager.getQuarantinedPlayerCount());
-        sendMessage(sender, YELLOW + "Protection mode: " +
-            (syncManager.isProtectionMode() ? RED + "ACTIVE (DB failures detected)" : GREEN + "Off"));
-        sendMessage(sender, YELLOW + "Heartbeat: " + WHITE +
-            "every " + configManager.getHeartbeatIntervalSeconds() + "s" +
-            " (lock-timeout=" + configManager.getLockTimeout() + "s)");
-        sendMessage(sender, YELLOW + "Async threads: " + WHITE +
-            "active=" + syncManager.getAsyncActiveCount() +
-            ", queue=" + syncManager.getAsyncQueueSize());
-        sendMessage(sender, YELLOW + "Login load budget: " + WHITE
-            + "available=" + syncManager.getLoginLoadAvailablePermits()
-            + "/" + syncManager.getLoginLoadLimit()
-            + " (max-concurrent-loads)");
-        String finalSaveColor = syncManager.hasFinalSaveAlert() ? RED
-            : (syncManager.hasFinalSaveWarning() ? YELLOW : GREEN);
-        sendMessage(sender, YELLOW + "Final-save executor: " + finalSaveColor +
-            "active=" + syncManager.getFinalSaveActiveCount() +
-            ", queue=" + syncManager.getFinalSaveQueueSize() + "/" + syncManager.getFinalSaveQueueCapacity() +
-            ", queueFull=" + syncManager.getFinalSaveQueueFullTotal() +
-            ", lastQueueFull=" + formatTime(syncManager.getFinalSaveLastQueueFullAt()));
-        sendMessage(sender, YELLOW + "Final-save spool events: " + WHITE +
-            "spooled=" + syncManager.getFinalSaveSpoolEnqueuedTotal() +
-            ", lastSpooled=" + formatTime(syncManager.getFinalSaveLastSpoolEnqueuedAt()) +
-            ", rejected=" + syncManager.getFinalSaveSpoolRejectedTotal() +
-            ", lastRejected=" + formatTime(syncManager.getFinalSaveLastSpoolRejectedAt()));
-        sendMessage(sender, YELLOW + "Final-save sync fallback: " + WHITE +
-            "total=" + syncManager.getFinalSaveSyncFallbackTotal() +
-            ", last=" + formatTime(syncManager.getFinalSaveLastSyncFallbackAt()));
+        sender.sendMessage(msg.component("command.status.header"));
+        sender.sendMessage(msg.component("command.status.server", configManager.getServerName()));
+        sender.sendMessage(msg.component(databaseHealthy
+            ? "command.status.database-connected" : "command.status.database-disconnected"));
+        sender.sendMessage(msg.component(redisHealthy ? "command.status.redis-connected"
+            : (configManager.isRedisEnabled() ? "command.status.redis-failed" : "command.status.redis-disabled")));
+        sender.sendMessage(msg.component("command.status.serialization"));
+        sender.sendMessage(msg.component("command.status.active-players", syncManager.getActiveCount()));
+        sender.sendMessage(msg.component("command.status.pending-loads", syncManager.getPendingCount()));
+        sender.sendMessage(msg.component("command.status.pending-saves", syncManager.getPendingSaveCount()));
+        sender.sendMessage(msg.component("command.status.quarantined", syncManager.getQuarantinedPlayerCount()));
+        sender.sendMessage(msg.component(syncManager.isProtectionMode()
+            ? "command.status.protection-active" : "command.status.protection-off"));
+        sender.sendMessage(msg.component("command.status.heartbeat",
+            configManager.getHeartbeatIntervalSeconds(), configManager.getLockTimeout()));
+        sender.sendMessage(msg.component("command.status.async-threads",
+            syncManager.getAsyncActiveCount(), syncManager.getAsyncQueueSize()));
+        sender.sendMessage(msg.component("command.status.login-load-budget",
+            syncManager.getLoginLoadAvailablePermits(), syncManager.getLoginLoadLimit()));
+        String finalSaveColor = syncManager.hasFinalSaveAlert() ? "&c"
+            : (syncManager.hasFinalSaveWarning() ? "&e" : "&a");
+        sender.sendMessage(msg.component("command.status.final-save-executor",
+            finalSaveColor,
+            syncManager.getFinalSaveActiveCount(),
+            syncManager.getFinalSaveQueueSize(), syncManager.getFinalSaveQueueCapacity(),
+            syncManager.getFinalSaveQueueFullTotal(),
+            formatTime(syncManager.getFinalSaveLastQueueFullAt())));
+        sender.sendMessage(msg.component("command.status.final-save-spool-events",
+            syncManager.getFinalSaveSpoolEnqueuedTotal(),
+            formatTime(syncManager.getFinalSaveLastSpoolEnqueuedAt()),
+            syncManager.getFinalSaveSpoolRejectedTotal(),
+            formatTime(syncManager.getFinalSaveLastSpoolRejectedAt())));
+        sender.sendMessage(msg.component("command.status.final-save-sync-fallback",
+            syncManager.getFinalSaveSyncFallbackTotal(),
+            formatTime(syncManager.getFinalSaveLastSyncFallbackAt())));
         // Spool disk state
         long spoolPending = syncManager.getFinalSaveSpoolPendingCount();
         long spoolFailed = syncManager.getFinalSaveSpoolFailedCount();
         if (spoolPending > 0 || spoolFailed > 0 || configManager.isFinalSaveSpoolEnabled()) {
-            String spoolColor = spoolFailed > 0 ? RED : (spoolPending > 0 ? YELLOW : GREEN);
-            sendMessage(sender, YELLOW + "FinalSaveSpool: " + spoolColor +
-                "pending=" + spoolPending +
-                ", failed=" + spoolFailed +
-                ", bytes=" + syncManager.getFinalSaveSpoolBytes());
+            String spoolColor = spoolFailed > 0 ? "&c" : (spoolPending > 0 ? "&e" : "&a");
+            sender.sendMessage(msg.component("command.status.final-save-spool-disk",
+                spoolColor, spoolPending, spoolFailed, syncManager.getFinalSaveSpoolBytes()));
             long lastReplay = syncManager.getFinalSaveSpoolLastReplayAt();
             if (lastReplay > 0) {
-                sendMessage(sender, YELLOW + "  lastReplay=" + WHITE
-                    + new java.util.Date(lastReplay));
+                sender.sendMessage(msg.component("command.status.final-save-spool-last-replay",
+                    new java.util.Date(lastReplay)));
             }
             String lastError = syncManager.getFinalSaveSpoolLastError();
             if (lastError != null && !lastError.isEmpty()) {
-                sendMessage(sender, RED + "  lastError=" + lastError);
+                sender.sendMessage(msg.component("command.status.final-save-spool-last-error", lastError));
             }
             if (spoolFailed > 0) {
-                sendMessage(sender, RED + "Spool FAILED entries exist — check "
-                    + configManager.getFinalSaveSpoolDir() + "/failed/ for .reason.txt files.");
+                sender.sendMessage(msg.component("command.status.final-save-spool-failed-entries",
+                    configManager.getFinalSaveSpoolDir()));
             }
         }
         // Alerts
         if (syncManager.getFinalSaveSpoolRejectedTotal() > 0) {
-            sendMessage(sender, RED + "Final-save CRITICAL: spool rejected/failure occurred. "
-                + "Final states may have been lost. Check logs and spool configuration.");
+            sender.sendMessage(msg.component("command.status.final-save-spool-rejected-alert"));
         }
         if (syncManager.getFinalSaveSyncFallbackTotal() > 0) {
-            sendMessage(sender, RED + "Final-save CRITICAL: synchronous fallback occurred. "
-                + "Game thread may have been blocked. Investigate DB latency / final-save queue sizing.");
+            sender.sendMessage(msg.component("command.status.final-save-sync-fallback-alert"));
         }
         if (syncManager.hasFinalSaveWarning() && !syncManager.hasFinalSaveAlert()) {
-            sendMessage(sender, YELLOW + "Final-save WARNING: queue-full events have occurred. "
-                + "Spool handled some final saves; monitor queue sizing and replay lag.");
+            sender.sendMessage(msg.component("command.status.final-save-warning"));
         }
         if (configManager.isOperationLogEnabled()) {
             long dropped = syncManager.getOperationLogDroppedTotal();
-            String opLogColor = dropped > 0 ? RED : GREEN;
-            sendMessage(sender, YELLOW + "OpLog: " + opLogColor +
-                "queue=" + syncManager.getOperationLogQueueSize() + "/" + syncManager.getOperationLogQueueCapacity() +
-                ", dropped=" + dropped);
+            String opLogColor = dropped > 0 ? "&c" : "&a";
+            sender.sendMessage(msg.component("command.status.oplog",
+                opLogColor,
+                syncManager.getOperationLogQueueSize(), syncManager.getOperationLogQueueCapacity(),
+                dropped));
             if (dropped > 0) {
                 long lastDropAt = syncManager.getOperationLogLastDropAt();
-                sendMessage(sender, RED + "OpLog ALERT: audit entries have been dropped"
-                    + (lastDropAt > 0 ? " since " + new java.util.Date(lastDropAt) : "")
-                    + ". Treat operation log as incomplete for incident review.");
+                sender.sendMessage(msg.component("command.status.oplog-alert",
+                    lastDropAt > 0 ? " since " + new java.util.Date(lastDropAt) : ""));
             }
         } else {
-            sendMessage(sender, YELLOW + "OpLog: " + GRAY + "Disabled");
+            sender.sendMessage(msg.component("command.status.oplog-disabled"));
         }
-        sendMessage(sender, YELLOW + "Compression: " +
-            (configManager.isCompressionEnabled() ? GREEN + "LZ4" : RED + "Disabled"));
-        sendMessage(sender, YELLOW + "Debug: " +
-            (configManager.isDebug() ? GREEN + "ON" : RED + "OFF"));
+        sender.sendMessage(msg.component(configManager.isCompressionEnabled()
+            ? "command.status.compression-enabled" : "command.status.compression-disabled"));
+        sender.sendMessage(msg.component(configManager.isDebug()
+            ? "command.status.debug-on" : "command.status.debug-off"));
 
         // HikariCP stats
         if (databaseManager.getDataSource() != null) {
             var pool = databaseManager.getDataSource().getHikariPoolMXBean();
             if (pool != null) {
-                sendMessage(sender, YELLOW + "DB Pool: " + WHITE +
-                    "active=" + pool.getActiveConnections() +
-                    ", idle=" + pool.getIdleConnections() +
-                    ", total=" + pool.getTotalConnections() +
-                    ", waiting=" + pool.getThreadsAwaitingConnection());
+                sender.sendMessage(msg.component("command.status.db-pool",
+                    pool.getActiveConnections(), pool.getIdleConnections(),
+                    pool.getTotalConnections(), pool.getThreadsAwaitingConnection()));
             }
         }
 
         // Latency stats (Dynamo p99.9) — now sent to sender, not just logged
-        sendMessage(sender, YELLOW + "Latency: " + GRAY + "(p50/p99/p99.9)");
+        sender.sendMessage(msg.component("command.status.latency-header"));
         for (String line : syncManager.getLatencyStatusLines()) {
-            sendMessage(sender, GRAY + "  " + line);
+            sender.sendMessage(msg.component("command.status.latency-line", line));
         }
 
         // Stream stats
-        sendMessage(sender, YELLOW + "Streams: " +
-            (configManager.isStreamsEnabled() ? GREEN + "Enabled" : RED + "Disabled"));
+        sender.sendMessage(msg.component(configManager.isStreamsEnabled()
+            ? "command.status.streams-enabled" : "command.status.streams-disabled"));
 
         // Snapshot stats (round 14b)
         if (syncManager.getSnapshotManager() != null) {
             var sm = syncManager.getSnapshotManager();
             long rejected = sm.getRejectedCount();
-            String snapColor = rejected > 0 ? RED : GREEN;
-            sendMessage(sender, YELLOW + "Snapshots: " + snapColor +
-                "queue=" + sm.getQueueSize() + "/" + sm.getQueueCapacity() +
-                ", rejected=" + rejected);
+            String snapColor = rejected > 0 ? "&c" : "&a";
+            sender.sendMessage(msg.component("command.status.snapshots",
+                snapColor, sm.getQueueSize(), sm.getQueueCapacity(), rejected));
         }
 
         // Cluster + production mode (round 14b)
-        sendMessage(sender, YELLOW + "Cluster: " + WHITE +
-            (configManager.getClusterId() != null && !configManager.getClusterId().isBlank()
-                ? configManager.getClusterId() : "(none)"));
+        String clusterId = configManager.getClusterId();
+        if (clusterId != null && !clusterId.isBlank()) {
+            sender.sendMessage(msg.component("command.status.cluster", clusterId));
+        } else {
+            sender.sendMessage(msg.component("command.status.cluster-none"));
+        }
         if (configManager.isProductionEnabled()) {
-            sendMessage(sender, YELLOW + "Production: " + GREEN + "ON" +
-                " (redis=" + (configManager.isProductionRequireRedis() ? "required" : "optional") +
-                ", sync-fallback=" + (configManager.isFinalSaveAllowSyncFallback() ? "allowed" : "blocked") + ")");
+            sender.sendMessage(msg.component("command.status.production",
+                configManager.isProductionRequireRedis() ? "required" : "optional",
+                configManager.isFinalSaveAllowSyncFallback() ? "allowed" : "blocked"));
         }
     }
 

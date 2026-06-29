@@ -1,0 +1,161 @@
+# FastSync Messages - English (default)
+# Use & color codes (e.g. &c for red, &a for green)
+# Placeholders: {0}, {1}, {2}, ...
+
+# ==================== Player Kick Messages ====================
+player:
+  kick:
+    load-fail: "&c[FastSync] Failed to load your player data. Please try reconnecting in a few seconds."
+    lock-timeout: "&c[FastSync] Your data is still being saved by another server. Please try reconnecting in a few seconds."
+    busy: "&c[FastSync] Data service is busy. Please reconnect in a few seconds."
+    prepare-fail: "&c[FastSync] Failed to prepare your data. Please reconnect."
+    apply-fail: "&c[FastSync] Failed to apply your data. Please reconnect."
+    lock-lost: "&c[FastSync] Your data lock was lost. Please reconnect to re-sync your data."
+
+# ==================== Command Responses ====================
+command:
+  no-permission: "&cYou don't have permission to use this command."
+
+  # --- Reload ---
+  reload:
+    success: "&a[FastSync] Configuration reloaded."
+    server: "&7Server: {0}"
+    compression: "&7Compression: {0}"
+    redis: "&7Redis: {0}"
+    heartbeat: "&7Heartbeat: every {0}s (timer restarted)"
+    protection-reset: "&a[FastSync] Protection mode reset."
+    protection-active: "&c[FastSync] Protection mode still active: database is unhealthy."
+
+  # --- Status ---
+  status:
+    checking: "&e[FastSync] Checking backend health..."
+    header: "&6===== FastSync Status ====="
+    server: "&eServer: &f{0}"
+    database-connected: "&eDatabase: &aConnected"
+    database-disconnected: "&eDatabase: &cDisconnected"
+    redis-connected: "&eRedis: &aConnected"
+    redis-failed: "&eRedis: &cFailed"
+    redis-disabled: "&eRedis: &7Disabled"
+    serialization: "&eSerialization: &fPaper native ItemStack byte serialization"
+    active-players: "&eActive players: &f{0}"
+    pending-loads: "&ePending loads: &f{0}"
+    pending-saves: "&ePending saves: &f{0}"
+    quarantined: "&eQuarantined: &f{0}"
+    protection-active: "&eProtection mode: &cACTIVE (DB failures detected)"
+    protection-off: "&eProtection mode: &aOff"
+    heartbeat: "&eHeartbeat: &fevery {0}s (lock-timeout={1}s)"
+    async-threads: "&eAsync threads: &factive={0}, queue={1}"
+    login-load-budget: "&eLogin load budget: &favailable={0}/{1} (max-concurrent-loads)"
+    final-save-executor: "&eFinal-save executor: {0}active={1}, queue={2}/{3}, queueFull={4}, lastQueueFull={5}"
+    final-save-spool-events: "&eFinal-save spool events: &fspooled={0}, lastSpooled={1}, rejected={2}, lastRejected={3}"
+    final-save-sync-fallback: "&eFinal-save sync fallback: &ftotal={0}, last={1}"
+    final-save-spool-disk: "&eFinalSaveSpool: {0}pending={1}, failed={2}, bytes={3}"
+    final-save-spool-last-replay: "&e  lastReplay=&f{0}"
+    final-save-spool-last-error: "&c  lastError={0}"
+    final-save-spool-failed-entries: "&cSpool FAILED entries exist — check {0}/failed/ for .reason.txt files."
+    final-save-spool-rejected-alert: "&cFinal-save CRITICAL: spool rejected/failure occurred. Final states may have been lost. Check logs and spool configuration."
+    final-save-sync-fallback-alert: "&cFinal-save CRITICAL: synchronous fallback occurred. Game thread may have been blocked. Investigate DB latency / final-save queue sizing."
+    final-save-warning: "&eFinal-save WARNING: queue-full events have occurred. Spool handled some final saves; monitor queue sizing and replay lag."
+    oplog: "&eOpLog: {0}queue={1}/{2}, dropped={3}"
+    oplog-alert: "&cOpLog ALERT: audit entries have been dropped{0}. Treat operation log as incomplete for incident review."
+    oplog-disabled: "&eOpLog: &7Disabled"
+    compression-enabled: "&eCompression: &aLZ4"
+    compression-disabled: "&eCompression: &cDisabled"
+    debug-on: "&eDebug: &aON"
+    debug-off: "&eDebug: &cOFF"
+    db-pool: "&eDB Pool: &factive={0}, idle={1}, total={2}, waiting={3}"
+    latency-header: "&eLatency: &7(p50/p99/p99.9)"
+    latency-line: "&7  {0}"
+    streams-enabled: "&eStreams: &aEnabled"
+    streams-disabled: "&eStreams: &cDisabled"
+    snapshots: "&eSnapshots: {0}queue={1}/{2}, rejected={3}"
+    cluster: "&eCluster: &f{0}"
+    cluster-none: "&eCluster: &f(none)"
+    production: "&eProduction: &aON (redis={0}, sync-fallback={1})"
+
+  # --- Debug ---
+  debug:
+    toggled: "&a[FastSync] Debug mode: {0}"
+
+  # --- SaveAll ---
+  saveall:
+    saving: "&e[FastSync] Saving all online players..."
+    all-saved: "&a[FastSync] All {0} players saved!"
+    partial: "&e[FastSync] Saved {0}/{1} players. &c{2} failed."
+    failed-players: "&7Failed players:"
+    failed-player: "&7  {0}: &c{1}"
+    error: "&c[FastSync] Saveall failed: {0}"
+
+  # --- Log ---
+  log:
+    usage: "&cUsage: /{0} log <player|uuid> [limit]"
+    invalid-number: "&cInvalid number: {0}"
+    player-not-found: "&cPlayer not found or invalid UUID: {0}"
+    no-entries: "&e[FastSync] No operation log entries for {0}"
+    header: "&6===== Operation Log: {0} ({1} entries) ====="
+    entry: "&7#{0} {1}&7 | server={2} v={3} ft={4} sz={5}B{6}"
+
+  # --- Help ---
+  help:
+    header: "&6===== FastSync ====="
+    reload: "&e/{0} reload &7- Reload configuration"
+    status: "&e/{0} status &7- Show plugin status"
+    debug: "&e/{0} debug &7- Toggle debug mode"
+    saveall: "&e/{0} saveall &7- Save all online players"
+    log: "&e/{0} log <player> [n] &7- View operation log for a player"
+
+# ==================== Console Messages ====================
+console:
+  startup:
+    enabled: "FastSync v{0} enabled!"
+    server-id: "Server ID: {0}"
+    serialization: "Serialization: Paper native ItemStack byte serialization"
+    compression: "Compression: {0}"
+    redis: "Redis: {0}"
+    periodic-save: "Periodic save enabled: every {0} seconds"
+    heartbeat-start: "Lock heartbeat {0}: every {1} seconds (lock-timeout={2}s)."
+    heartbeat-restarted: "Lock heartbeat restarted: every {0} seconds (lock-timeout={1}s)."
+    handoff-channel: "Registered fastsync:handoff plugin messaging channel (optional: for Velocity proxy integration)"
+    dirty-tracking: "Dirty tracking enabled: validation every {0} saves"
+    snapshot: "Snapshot/backup system enabled (max {0} per player)."
+    pdc-strategy: "PDC sync strategy: {0}{1}"
+  shutdown:
+    saving: "Saving all online players (shutdown)..."
+    save-result: "Shutdown save: {0}/{1} succeeded{2}."
+    disabled: "FastSync disabled!"
+  config:
+    load-failed: "Failed to load config.yml — refusing to start: {0}"
+    refusing-start: "Refusing to start: {0}"
+    db-init-failed: "Failed to initialize database! Check your config.yml."
+  saveall:
+    failed: "Saveall failed"
+  sender-retired: "Command sender retired before response could be sent"
+
+# ==================== Proxy Messages ====================
+proxy:
+  command:
+    header: "FastSync Proxy Commands:"
+    status: "  /fastsync status  - Show aggregated backend status"
+    players: "  /fastsync players - Show player→server mapping"
+    reload: "  /fastsync reload  - Reload proxy config"
+    debug: "  /fastsync debug   - Toggle debug mode"
+  status:
+    querying: "Querying backend servers..."
+    no-backends: "No backends responded."
+    header: "===== FastSync Proxy Status ====="
+    backend: "  {0} | DB: {1} | Redis: {2} | Players: {3} | Save: {4} | Load: {5}"
+    total-players: "Total players on proxy: {0}"
+    query-failed: "Failed to query backends: {0}"
+  players:
+    none: "No tracked players."
+    header: "===== Tracked Players ====="
+    entry: "  {0} → {1}"
+    total: "Total: {0} players"
+  reload:
+    success: "FastSync proxy config reloaded."
+  debug:
+    state: "Debug mode: {0}"
+    hint: "(Edit proxy-config.yml and run /fastsync reload to change)"
+  handoff:
+    waiting: "&e[FastSync] Waiting for your data to be saved..."
+    timeout: "&c[FastSync] Data save timed out, transferring anyway."

@@ -2,7 +2,7 @@ package com.fastsync.listeners;
 
 import com.fastsync.FastSync;
 import com.fastsync.sync.SyncManager;
-import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
+import net.kyori.adventure.text.Component;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
@@ -21,9 +21,6 @@ import java.util.UUID;
  * is loaded after the player has already entered the server.
  */
 public class PlayerListener implements Listener {
-
-    private static final LegacyComponentSerializer KICK_MESSAGE_SERIALIZER =
-        LegacyComponentSerializer.legacyAmpersand();
 
     private final FastSync plugin;
     private final SyncManager syncManager;
@@ -53,20 +50,20 @@ public class PlayerListener implements Listener {
         SyncManager.LoadResult result = syncManager.loadPlayerData(uuid);
 
         if (!result.isSuccess()) {
-            String msg;
+            Component kickMessage;
             if (result.getStatus() == SyncManager.LoadResult.Status.LOCKED) {
-                msg = plugin.getConfigManager().getLockTimeoutKickMessage();
+                kickMessage = plugin.getMessageManager().component("player.kick.lock-timeout");
             } else if (result.getStatus() == SyncManager.LoadResult.Status.BUSY) {
                 // Login backpressure: too many concurrent loads. Use the
                 // dedicated busy-kick-message so players know to retry.
-                msg = plugin.getConfigManager().getBusyKickMessage();
+                kickMessage = plugin.getMessageManager().component("player.kick.busy");
             } else {
                 plugin.getLogger().warning("Failed to load data for " + uuid + ": " + result.getMessage());
-                msg = plugin.getConfigManager().getLoadFailKickMessage();
+                kickMessage = plugin.getMessageManager().component("player.kick.load-fail");
             }
             event.disallow(
                 AsyncPlayerPreLoginEvent.Result.KICK_OTHER,
-                KICK_MESSAGE_SERIALIZER.deserialize(msg)
+                kickMessage
             );
         }
     }

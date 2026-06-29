@@ -174,6 +174,7 @@ public class ConfigManager {
     // Debug
     private boolean debug;
     private boolean logTiming;
+    private String language = "en";
 
     // Dynamo-style conflict recovery
     private String conflictRecoveryStrategy; // "snapshot", "discard"
@@ -669,6 +670,7 @@ public class ConfigManager {
         // Debug
         debug = source.getBoolean("debug", false);
         logTiming = source.getBoolean("log-timing", false);
+        language = source.getString("language", "en");
 
         // Dynamo-style conflict recovery
         conflictRecoveryStrategy = source.getString("conflict.recovery-strategy", "snapshot");
@@ -814,6 +816,7 @@ public class ConfigManager {
 
     public boolean isDebug() { return debug; }
     public boolean isLogTiming() { return logTiming; }
+    public String getLanguage() { return language; }
 
     public String getConflictRecoveryStrategy() { return conflictRecoveryStrategy; }
     public boolean isVerifyChecksum() { return verifyChecksum; }

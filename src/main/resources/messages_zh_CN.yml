@@ -1,0 +1,161 @@
+# FastSync 消息文件 - 简体中文
+# 使用 & 颜色代码（如 &c 表示红色, &a 表示绿色）
+# 占位符: {0}, {1}, {2}, ...
+
+# ==================== 玩家踢出消息 ====================
+player:
+  kick:
+    load-fail: "&c[FastSync] 加载玩家数据失败。请稍后重试。"
+    lock-timeout: "&c[FastSync] 您的数据仍被另一个服务器保存中。请稍后重试。"
+    busy: "&c[FastSync] 数据服务繁忙。请稍后重试。"
+    prepare-fail: "&c[FastSync] 数据准备失败。请重新连接。"
+    apply-fail: "&c[FastSync] 数据应用失败。请重新连接。"
+    lock-lost: "&c[FastSync] 您的数据锁已丢失。请重新连接以重新同步数据。"
+
+# ==================== 命令响应 ====================
+command:
+  no-permission: "&c您没有权限使用此命令。"
+
+  # --- 重载 ---
+  reload:
+    success: "&a[FastSync] 配置已重载。"
+    server: "&7服务器: {0}"
+    compression: "&7压缩: {0}"
+    redis: "&7Redis: {0}"
+    heartbeat: "&7心跳: 每 {0} 秒（定时器已重启）"
+    protection-reset: "&a[FastSync] 保护模式已重置。"
+    protection-active: "&c[FastSync] 保护模式仍处于活动状态：数据库不健康。"
+
+  # --- 状态 ---
+  status:
+    checking: "&e[FastSync] 正在检查后端健康状态..."
+    header: "&6===== FastSync 状态 ====="
+    server: "&e服务器: &f{0}"
+    database-connected: "&e数据库: &a已连接"
+    database-disconnected: "&e数据库: &c未连接"
+    redis-connected: "&eRedis: &a已连接"
+    redis-failed: "&eRedis: &c失败"
+    redis-disabled: "&eRedis: &7未启用"
+    serialization: "&e序列化: &fPaper 原生 ItemStack 字节序列化"
+    active-players: "&e在线玩家: &f{0}"
+    pending-loads: "&e待加载: &f{0}"
+    pending-saves: "&e待保存: &f{0}"
+    quarantined: "&e已隔离: &f{0}"
+    protection-active: "&e保护模式: &c活跃（检测到数据库故障）"
+    protection-off: "&e保护模式: &a关闭"
+    heartbeat: "&e心跳: &f每 {0} 秒（锁超时={1} 秒）"
+    async-threads: "&e异步线程: &f活跃={0}, 队列={1}"
+    login-load-budget: "&e登录加载预算: &f可用={0}/{1}（最大并发加载）"
+    final-save-executor: "&e最终保存执行器: {0}活跃={1}, 队列={2}/{3}, 队列满={4}, 上次队列满={5}"
+    final-save-spool-events: "&e最终保存脱机事件: &f已脱机={0}, 上次脱机={1}, 被拒={2}, 上次被拒={3}"
+    final-save-sync-fallback: "&e最终保存同步回退: &f总计={0}, 上次={1}"
+    final-save-spool-disk: "&e最终保存脱机磁盘: {0}待处理={1}, 失败={2}, 字节={3}"
+    final-save-spool-last-replay: "&e  上次回放=&f{0}"
+    final-save-spool-last-error: "&c  上次错误={0}"
+    final-save-spool-failed-entries: "&c脱机存在失败条目 — 请检查 {0}/failed/ 目录中的 .reason.txt 文件。"
+    final-save-spool-rejected-alert: "&c最终保存严重：脱机拒绝/故障已发生。最终状态可能已丢失。请检查日志和脱机配置。"
+    final-save-sync-fallback-alert: "&c最终保存严重：已发生同步回退。游戏线程可能被阻塞。请排查数据库延迟/最终保存队列大小。"
+    final-save-warning: "&e最终保存警告：已发生队列满事件。脱机已处理部分最终保存；请监控队列大小和回放延迟。"
+    oplog: "&e操作日志: {0}队列={1}/{2}, 丢弃={3}"
+    oplog-alert: "&c操作日志警报：审计条目已被丢弃{0}。操作日志不完整，请谨慎用于事件审查。"
+    oplog-disabled: "&e操作日志: &7未启用"
+    compression-enabled: "&e压缩: &aLZ4"
+    compression-disabled: "&e压缩: &c未启用"
+    debug-on: "&e调试: &a开启"
+    debug-off: "&e调试: &c关闭"
+    db-pool: "&e数据库连接池: &f活跃={0}, 空闲={1}, 总计={2}, 等待={3}"
+    latency-header: "&e延迟: &7(p50/p99/p99.9)"
+    latency-line: "&7  {0}"
+    streams-enabled: "&e流: &a已启用"
+    streams-disabled: "&e流: &c未启用"
+    snapshots: "&e快照: {0}队列={1}/{2}, 拒绝={3}"
+    cluster: "&e集群: &f{0}"
+    cluster-none: "&e集群: &f(无)"
+    production: "&e生产模式: &a开启 (redis={0}, 同步回退={1})"
+
+  # --- 调试 ---
+  debug:
+    toggled: "&a[FastSync] 调试模式: {0}"
+
+  # --- 全部保存 ---
+  saveall:
+    saving: "&e[FastSync] 正在保存所有在线玩家..."
+    all-saved: "&a[FastSync] 所有 {0} 个玩家已保存！"
+    partial: "&e[FastSync] 已保存 {0}/{1} 个玩家。&c{2} 个失败。"
+    failed-players: "&7失败玩家:"
+    failed-player: "&7  {0}: &c{1}"
+    error: "&c[FastSync] 全部保存失败: {0}"
+
+  # --- 日志 ---
+  log:
+    usage: "&c用法: /{0} log <玩家名|UUID> [数量]"
+    invalid-number: "&c无效数字: {0}"
+    player-not-found: "&c未找到玩家或 UUID 无效: {0}"
+    no-entries: "&e[FastSync] 没有找到 {0} 的操作日志"
+    header: "&6===== 操作日志: {0}（{1} 条记录）====="
+    entry: "&7#{0} {1}&7 | 服务器={2} v={3} ft={4} 大小={5}B{6}"
+
+  # --- 帮助 ---
+  help:
+    header: "&6===== FastSync ====="
+    reload: "&e/{0} reload &7- 重载配置"
+    status: "&e/{0} status &7- 显示插件状态"
+    debug: "&e/{0} debug &7- 切换调试模式"
+    saveall: "&e/{0} saveall &7- 保存所有在线玩家"
+    log: "&e/{0} log <玩家> [n] &7- 查看玩家操作日志"
+
+# ==================== 控制台消息 ====================
+console:
+  startup:
+    enabled: "FastSync v{0} 已启用！"
+    server-id: "服务器 ID: {0}"
+    serialization: "序列化: Paper 原生 ItemStack 字节序列化"
+    compression: "压缩: {0}"
+    redis: "Redis: {0}"
+    periodic-save: "定期保存已启用: 每 {0} 秒"
+    heartbeat-start: "锁心跳 {0}: 每 {1} 秒（锁超时={2} 秒）。"
+    heartbeat-restarted: "锁心跳已重启: 每 {0} 秒（锁超时={1} 秒）。"
+    handoff-channel: "已注册 fastsync:handoff 插件消息通道（可选: 用于 Velocity 代理集成）"
+    dirty-tracking: "脏数据跟踪已启用: 每 {0} 次保存验证"
+    snapshot: "快照/备份系统已启用（每位玩家最多 {0} 个）。"
+    pdc-strategy: "PDC 同步策略: {0}{1}"
+  shutdown:
+    saving: "正在保存所有在线玩家（关闭中）..."
+    save-result: "关闭保存: {0}/{1} 成功{2}。"
+    disabled: "FastSync 已禁用！"
+  config:
+    load-failed: "加载 config.yml 失败 — 拒绝启动: {0}"
+    refusing-start: "拒绝启动: {0}"
+    db-init-failed: "数据库初始化失败！请检查 config.yml。"
+  saveall:
+    failed: "全部保存失败"
+  sender-retired: "命令发送者在响应发送前已退出"
+
+# ==================== 代理消息 ====================
+proxy:
+  command:
+    header: "FastSync 代理命令:"
+    status: "  /fastsync status  - 显示后端聚合状态"
+    players: "  /fastsync players - 显示玩家→服务器映射"
+    reload: "  /fastsync reload  - 重载代理配置"
+    debug: "  /fastsync debug   - 切换调试模式"
+  status:
+    querying: "正在查询后端服务器..."
+    no-backends: "没有后端响应。"
+    header: "===== FastSync 代理状态 ====="
+    backend: "  {0} | 数据库: {1} | Redis: {2} | 玩家: {3} | 保存: {4} | 加载: {5}"
+    total-players: "代理上的总玩家数: {0}"
+    query-failed: "查询后端失败: {0}"
+  players:
+    none: "没有跟踪的玩家。"
+    header: "===== 已跟踪玩家 ====="
+    entry: "  {0} → {1}"
+    total: "总计: {0} 个玩家"
+  reload:
+    success: "FastSync 代理配置已重载。"
+  debug:
+    state: "调试模式: {0}"
+    hint: "（编辑 proxy-config.yml 并运行 /fastsync reload 来更改）"
+  handoff:
+    waiting: "&e[FastSync] 正在等待您的数据保存..."
+    timeout: "&c[FastSync] 数据保存超时，正在强制转移。"

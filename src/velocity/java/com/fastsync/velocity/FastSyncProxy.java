@@ -18,12 +18,16 @@ import com.velocitypowered.api.proxy.messages.ChannelIdentifier;
 import com.velocitypowered.api.proxy.messages.MinecraftChannelIdentifier;
 import com.velocitypowered.api.proxy.server.RegisteredServer;
 import net.kyori.adventure.text.Component;
-import net.kyori.adventure.text.format.NamedTextColor;
 import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
 import org.slf4j.Logger;
+import org.yaml.snakeyaml.Yaml;
 
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -63,6 +67,9 @@ public class FastSyncProxy {
 
     private ProxyConfig config;
 
+    /** i18n messages loaded from proxy-messages.yml (dot-notation keys) */
+    private final Map<String, String> messages = new HashMap<>();
+
     /** Track player -> current backend server name */
     private final ConcurrentHashMap<UUID, String> playerServerMap = new ConcurrentHashMap<>();
 
@@ -86,6 +93,9 @@ public class FastSyncProxy {
     public void onProxyInit(ProxyInitializeEvent event) {
         config = new ProxyConfig(dataDirectory, logger);
         config.load();
+
+        // Load i18n messages from the bundled proxy-messages.yml resource
+        loadMessages();
 
         // Register the handoff plugin messaging channel
         proxy.getChannelRegistrar().register(HANDOFF_CHANNEL);
@@ -330,6 +340,67 @@ public class FastSyncProxy {
     public ProxyConfig getConfig() { return config; }
     public Logger getLogger() { return logger; }
 
+    // ==================== i18n ====================
+
+    /**
+     * Resolve a message key to an Adventure Component.
+     *
+     * <p>Templates are loaded from {@code proxy-messages.yml} (bundled in the
+     * jar). Placeholders use {@code {0}}, {@code {1}}, ... notation and are
+     * replaced before color-code parsing, so argument values may themselves
+     * contain {@code &} color codes.
+     *
+     * @param key  the dot-notation message key (e.g. "proxy.status.header")
+     * @param args placeholder values for {0}, {1}, ...
+     * @return the deserialized Component, or the key itself if not found
+     */
+    private Component msg(String key, Object... args) {
+        String template = messages.getOrDefault(key, key);
+        if (args.length > 0) {
+            for (int i = 0; i < args.length; i++) {
+                template = template.replace("{" + i + "}", String.valueOf(args[i]));
+            }
+        }
+        return LegacyComponentSerializer.legacyAmpersand().deserialize(template);
+    }
+
+    /**
+     * Load proxy messages from the bundled {@code /proxy-messages.yml} resource
+     * into the flat {@link #messages} map using dot-notation keys.
+     */
+    private void loadMessages() {
+        try (InputStream in = getClass().getResourceAsStream("/proxy-messages.yml")) {
+            if (in == null) {
+                logger.warn("proxy-messages.yml resource not found; message keys will be used as-is");
+                return;
+            }
+            Yaml yaml = new Yaml();
+            Map<String, Object> root = yaml.load(new InputStreamReader(in, StandardCharsets.UTF_8));
+            if (root != null) {
+                flattenMessages("", root);
+            }
+            logger.info("Loaded {} proxy messages", messages.size());
+        } catch (Exception e) {
+            logger.warn("Failed to load proxy-messages.yml", e);
+        }
+    }
+
+    /**
+     * Recursively flatten a nested YAML map into dot-notation keys.
+     */
+    @SuppressWarnings("unchecked")
+    private void flattenMessages(String prefix, Map<String, Object> map) {
+        for (Map.Entry<String, Object> entry : map.entrySet()) {
+            String key = prefix.isEmpty() ? entry.getKey() : prefix + "." + entry.getKey();
+            Object value = entry.getValue();
+            if (value instanceof Map) {
+                flattenMessages(key, (Map<String, Object>) value);
+            } else {
+                messages.put(key, String.valueOf(value));
+            }
+        }
+    }
+
     // ==================== Command ====================
 
     private class FastSyncCommand implements SimpleCommand {
@@ -371,83 +442,67 @@ public class FastSyncProxy {
         }
 
         private void sendHelp(CommandSource source) {
-            source.sendMessage(Component.text("FastSync Proxy Commands:", NamedTextColor.GOLD));
-            source.sendMessage(Component.text("  /fastsync status  - Show aggregated backend status", NamedTextColor.YELLOW));
-            source.sendMessage(Component.text("  /fastsync players - Show player→server mapping", NamedTextColor.YELLOW));
-            source.sendMessage(Component.text("  /fastsync reload  - Reload proxy config", NamedTextColor.YELLOW));
-            source.sendMessage(Component.text("  /fastsync debug   - Toggle debug mode", NamedTextColor.YELLOW));
+            source.sendMessage(msg("proxy.command.header"));
+            source.sendMessage(msg("proxy.command.status"));
+            source.sendMessage(msg("proxy.command.players"));
+            source.sendMessage(msg("proxy.command.reload"));
+            source.sendMessage(msg("proxy.command.debug"));
         }
 
         private void handleStatus(CommandSource source) {
-            source.sendMessage(Component.text("Querying backend servers...", NamedTextColor.YELLOW));
+            source.sendMessage(msg("proxy.status.querying"));
 
             queryAllStatus().thenAccept(results -> {
                 if (results.isEmpty()) {
-                    source.sendMessage(Component.text("No backends responded.", NamedTextColor.RED));
+                    source.sendMessage(msg("proxy.status.no-backends"));
                     return;
                 }
 
-                source.sendMessage(Component.text("===== FastSync Proxy Status =====", NamedTextColor.GOLD));
+                source.sendMessage(msg("proxy.status.header"));
                 for (HandoffProtocol.StatusResponseData s : results) {
-                    NamedTextColor dbColor = s.dbHealthy() ? NamedTextColor.GREEN : NamedTextColor.RED;
-                    NamedTextColor redisColor = s.redisHealthy() ? NamedTextColor.GREEN : NamedTextColor.RED;
-
-                    source.sendMessage(
-                        Component.text("  " + s.serverName() + " ", NamedTextColor.AQUA)
-                            .append(Component.text("| DB: ", NamedTextColor.GRAY))
-                            .append(Component.text(s.dbHealthy() ? "OK" : "FAIL", dbColor))
-                            .append(Component.text(" | Redis: ", NamedTextColor.GRAY))
-                            .append(Component.text(s.redisHealthy() ? "OK" : "FAIL", redisColor))
-                            .append(Component.text(" | Players: ", NamedTextColor.GRAY))
-                            .append(Component.text(String.valueOf(s.playerCount()), NamedTextColor.WHITE))
-                            .append(Component.text(" | Save: ", NamedTextColor.GRAY))
-                            .append(Component.text(String.valueOf(s.pendingSaves()), NamedTextColor.WHITE))
-                            .append(Component.text(" | Load: ", NamedTextColor.GRAY))
-                            .append(Component.text(String.valueOf(s.pendingLoads()), NamedTextColor.WHITE))
-                    );
+                    source.sendMessage(msg("proxy.status.backend",
+                        s.serverName(),
+                        s.dbHealthy() ? "&aOK" : "&cFAIL",
+                        s.redisHealthy() ? "&aOK" : "&cFAIL",
+                        s.playerCount(),
+                        s.pendingSaves(),
+                        s.pendingLoads()));
                 }
-                source.sendMessage(Component.text("Total players on proxy: " + playerServerMap.size(),
-                    NamedTextColor.GRAY));
+                source.sendMessage(msg("proxy.status.total-players", playerServerMap.size()));
             }).exceptionally(ex -> {
-                source.sendMessage(Component.text("Failed to query backends: " + ex.getMessage(),
-                    NamedTextColor.RED));
+                source.sendMessage(msg("proxy.status.query-failed", ex.getMessage()));
                 return null;
             });
         }
 
         private void handlePlayers(CommandSource source) {
             if (playerServerMap.isEmpty()) {
-                source.sendMessage(Component.text("No tracked players.", NamedTextColor.YELLOW));
+                source.sendMessage(msg("proxy.players.none"));
                 return;
             }
 
-            source.sendMessage(Component.text("===== Tracked Players =====", NamedTextColor.GOLD));
+            source.sendMessage(msg("proxy.players.header"));
             playerServerMap.forEach((uuid, server) -> {
                 // Try to get the online player name
                 String name = proxy.getPlayer(uuid)
                     .map(Player::getUsername)
                     .orElse(uuid.toString().substring(0, 8) + "...");
 
-                source.sendMessage(
-                    Component.text("  " + name, NamedTextColor.AQUA)
-                        .append(Component.text(" → " + server, NamedTextColor.YELLOW))
-                );
+                source.sendMessage(msg("proxy.players.entry", name, server));
             });
-            source.sendMessage(Component.text("Total: " + playerServerMap.size() + " players",
-                NamedTextColor.GRAY));
+            source.sendMessage(msg("proxy.players.total", playerServerMap.size()));
         }
 
         private void handleReload(CommandSource source) {
             config.load();
-            source.sendMessage(Component.text("FastSync proxy config reloaded.", NamedTextColor.GREEN));
+            source.sendMessage(msg("proxy.reload.success"));
         }
 
         private void handleDebug(CommandSource source) {
             // Toggle debug by reloading config with debug inverted
             // Since we can't easily mutate the loaded config, just log
-            source.sendMessage(Component.text("Debug mode: " + config.isDebug(), NamedTextColor.YELLOW));
-            source.sendMessage(Component.text("(Edit proxy-config.yml and run /fastsync reload to change)",
-                NamedTextColor.GRAY));
+            source.sendMessage(msg("proxy.debug.state", config.isDebug()));
+            source.sendMessage(msg("proxy.debug.hint"));
         }
     }
 }

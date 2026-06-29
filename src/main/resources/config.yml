@@ -402,6 +402,10 @@ serialization:
 # ------------------------------------------------------------
 debug: false
 
+# Language for plugin messages (en, zh_CN)
+# Custom languages can be added by placing messages_<lang>.yml in the lang/ folder
+language: "en"
+
 # Whether to log detailed timing information for serialization and database operations
 log-timing: false
 
