@@ -3104,7 +3104,7 @@ public class SyncManager {
             // runAtEntity falls back to the main thread, which is fine.
             SchedulerUtil.runAtEntity(plugin, player, () -> {
                 if (player.isOnline()) {
-                    player.kick(plugin.getMessageManager().component("player.kick.lock-lost"));
+                    player.kick(this.plugin.getMessageManager().component("player.kick.lock-lost"));
                 }
             }, () -> {
                 // Entity retired between lookup and dispatch — player is gone, nothing to kick.
