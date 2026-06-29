@@ -37,7 +37,7 @@ class SyncManagerFinalSaveSpoolTest {
         SyncManager manager = new SyncManager(plugin(), config, mock(DatabaseManager.class));
         FinalSaveSpool spool = new FinalSaveSpool(
             Logger.getLogger("final-save-spool-test"), tempDir, false, 10, 1_000_000, 7);
-        setField(manager, "finalSaveSpool", spool);
+        setSpool(manager, spool);
 
         UUID uuid = UUID.randomUUID();
         PlayerData data = new PlayerData();
@@ -78,7 +78,7 @@ class SyncManagerFinalSaveSpoolTest {
         SyncManager manager = new SyncManager(plugin(), config, database);
         FinalSaveSpool spool = new FinalSaveSpool(
             Logger.getLogger("final-save-spool-test"), tempDir, false, 10, 1_000_000, 7);
-        setField(manager, "finalSaveSpool", spool);
+        setSpool(manager, spool);
 
         @SuppressWarnings("unchecked")
         ConcurrentHashMap<UUID, String> sessions =
@@ -110,7 +110,7 @@ class SyncManagerFinalSaveSpoolTest {
         SyncManager manager = new SyncManager(plugin(), config, mock(DatabaseManager.class));
         FinalSaveSpool spool = new FinalSaveSpool(
             Logger.getLogger("final-save-spool-test"), tempDir, false, 10, 1_000_000, 7);
-        setField(manager, "finalSaveSpool", spool);
+        setSpool(manager, spool);
 
         boolean spooled = manager.spoolRetryableFinalSave(
             UUID.randomUUID(), new PlayerData(), SyncManager.SaveKind.QUIT,
@@ -183,5 +183,11 @@ class SyncManagerFinalSaveSpoolTest {
         Field field = target.getClass().getDeclaredField(name);
         field.setAccessible(true);
         return field.get(target);
+    }
+
+    /** Set the spool on the FinalSaveStats delegate inside SyncManager. */
+    private static void setSpool(SyncManager manager, FinalSaveSpool spool) throws Exception {
+        FinalSaveStats stats = (FinalSaveStats) getField(manager, "finalSaveStats");
+        stats.setSpool(spool);
     }
 }

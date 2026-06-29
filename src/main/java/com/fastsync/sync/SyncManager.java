@@ -6,14 +6,12 @@ import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
 import org.bukkit.plugin.Plugin;
 import org.bukkit.plugin.java.JavaPlugin;
 import com.fastsync.concurrent.AsyncExecutor;
-import com.fastsync.concurrent.LatencyTracker;
 import com.fastsync.config.ConfigManager;
 import com.fastsync.conflict.ConflictManager;
 import com.fastsync.data.PlayerData;
 import com.fastsync.database.DatabaseManager;
 import com.fastsync.database.LockResult;
 import com.fastsync.log.OperationLog;
-import com.fastsync.log.FileOperationLogManager;
 import com.fastsync.log.OperationType;
 import com.fastsync.redis.RedissonManager;
 import com.fastsync.redis.stream.StreamEvent;
@@ -40,7 +38,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.io.IOException;
@@ -93,12 +90,11 @@ public class SyncManager {
     private RedissonManager redissonManager;
     private SnapshotManager snapshotManager;
     private ConflictManager conflictManager;
-    private FileOperationLogManager operationLogManager;
 
-    // Dynamo-style p99.9 latency tracking
-    private LatencyTracker loadLatency;
-    private LatencyTracker saveLatency;
-    private LatencyTracker serializeLatency;
+    // Extracted delegates (reduce God Class size)
+    private final LatencyMonitor latencyMonitor = new LatencyMonitor();
+    private final FinalSaveStats finalSaveStats;
+    private final OperationLogDelegate operationLogDelegate;
 
     // Data loaded during pre-login, waiting to be applied on join.
     // ConcurrentHashMap does not permit null values, so players with no saved
@@ -111,18 +107,6 @@ public class SyncManager {
     private final java.util.Set<UUID> bypassedPlayers = ConcurrentHashMap.newKeySet();
     private final ConcurrentHashMap<UUID, DeathState> deathStates = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<UUID, Long> pendingLoadTimes = new ConcurrentHashMap<>();
-
-    // Final-save saturation telemetry. A queue-full event on finalSaveExecutor
-    // immediately causes a synchronous fallback today, so we count both the
-    // rejection and the fallback and surface them in /fastsync status.
-    private final AtomicLong finalSaveQueueFullTotal = new AtomicLong();
-    private final AtomicLong finalSaveLastQueueFullAt = new AtomicLong();
-    private final AtomicLong finalSaveSpoolEnqueuedTotal = new AtomicLong();
-    private final AtomicLong finalSaveLastSpoolEnqueuedAt = new AtomicLong();
-    private final AtomicLong finalSaveSpoolRejectedTotal = new AtomicLong();
-    private final AtomicLong finalSaveLastSpoolRejectedAt = new AtomicLong();
-    private final AtomicLong finalSaveSyncFallbackTotal = new AtomicLong();
-    private final AtomicLong finalSaveLastSyncFallbackAt = new AtomicLong();
 
     // Track players whose data has been applied (actively playing)
     private final ConcurrentHashMap<UUID, Boolean> activePlayers = new ConcurrentHashMap<>();
@@ -305,6 +289,8 @@ public class SyncManager {
         this.config = config;
         this.databaseManager = databaseManager;
         this.logger = plugin.getLogger();
+        this.finalSaveStats = new FinalSaveStats(logger, config);
+        this.operationLogDelegate = new OperationLogDelegate(logger, config);
     }
 
     /**
@@ -324,6 +310,7 @@ public class SyncManager {
                     config.getFinalSaveSpoolMaxFiles(),
                     config.getFinalSaveSpoolMaxBytes(),
                     config.getFinalSaveSpoolRetainFailedDays());
+                finalSaveStats.setSpool(finalSaveSpool);
                 if (config.isFinalSaveSpoolReplayOnStartup()) {
                     finalSaveReplayService = new com.fastsync.spool.FinalSaveReplayService(
                         logger, finalSaveSpool, databaseManager, plugin,
@@ -417,23 +404,13 @@ public class SyncManager {
 
         // Initialize operation log (file-based append-only journal, no JVM args needed)
         if (config.isOperationLogEnabled()) {
-            try {
-                operationLogManager = new FileOperationLogManager(
-                    plugin.getDataFolder().toPath(), config.getOperationLogRetention());
-                operationLogManager.initialize();
-                logger.info("Operation log enabled (file-based, retention=" +
-                    config.getOperationLogRetention() + " per player).");
-            } catch (Exception e) {
-                logger.log(Level.WARNING, "Failed to initialize operation log (file-based)", e);
-            }
+            operationLogDelegate.initialize(plugin.getDataFolder());
         }
 
         // Initialize latency trackers (Dynamo p99.9 SLA focus)
         if (config.isLatencyTrackingEnabled()) {
             int window = config.getLatencyWindowSize();
-            loadLatency = new LatencyTracker("DB-Load", logger, window);
-            saveLatency = new LatencyTracker("DB-Save", logger, window);
-            serializeLatency = new LatencyTracker("Serialize", logger, window);
+            latencyMonitor.init(logger, window);
             logger.info("Latency tracking enabled (p50/p99/p99.9, window=" + window + ").");
         }
 
@@ -675,7 +652,7 @@ public class SyncManager {
             componentCursors.put(uuid,
                 new ComponentCursor(loaded.componentGeneration(), loaded.componentBitmap()));
             long loadElapsedMs = (System.nanoTime() - startTime) / 1_000_000;
-            if (loadLatency != null) loadLatency.record(loadElapsedMs);
+            latencyMonitor.recordLoad(loadElapsedMs);
 
             if (config.isLogTiming()) {
                 logger.info("[Timing] DB load for " + uuid + ": " + loadElapsedMs + "ms");
@@ -718,7 +695,7 @@ public class SyncManager {
                     decompressed != null ? decompressed.length : 0,
                     "Checksum mismatch: stored=" + loaded.checksum());
 
-                if (loadLatency != null) loadLatency.recordError();
+                latencyMonitor.recordLoadError();
             // Release the lock via the unified helper (fail-closed on null
             // token/session; catches SQLException AND RuntimeException so a
             // defensive IllegalArgumentException can't escape the load path).
@@ -806,7 +783,7 @@ public class SyncManager {
             playersWithBaseline.add(uuid);
 
             long deserElapsedMs = (System.nanoTime() - startTime) / 1_000_000;
-            if (serializeLatency != null) serializeLatency.record(deserElapsedMs);
+            latencyMonitor.recordSerialize(deserElapsedMs);
 
             if (config.isLogTiming()) {
                 logger.info("[Timing] Deserialize for " + uuid + ": " + deserElapsedMs + "ms" +
@@ -821,7 +798,7 @@ public class SyncManager {
             }
 
             // Log operation (Raft-inspired per-UUID ordered log)
-            logOperation(uuid, OperationType.LOAD, fencingToken, loaded.version(),
+            operationLogDelegate.logOperation(uuid, OperationType.LOAD, fencingToken, loaded.version(),
                 loaded.data().length, "Loaded from DB");
 
             // Publish critical event: player has checked in (Streams — recoverable)
@@ -1369,30 +1346,10 @@ public class SyncManager {
             if (!config.isFinalSaveAllowSyncFallback()) {
                 // Spool the final save to disk for later replay.
                 // This prevents data loss when the final-save executor is saturated.
-                FinalSaveQueueFullOutcome outcome;
-                String detail;
-                try {
-                    String session = playerLockSessions.get(uuid);
-                    if (finalSaveSpool != null) {
-                        com.fastsync.spool.EncodedFinalSave encoded = com.fastsync.spool.FinalSaveEncoder.encode(
-                            uuid, data, SaveKind.QUIT,
-                            config.getClusterId(), config.getServerName(),
-                            session, config.getCompressionMinSize());
-                        finalSaveSpool.append(encoded);
-                        outcome = FinalSaveQueueFullOutcome.SPOOLED;
-                        detail = "queue full — final save safely spooled to disk for replay";
-                    } else {
-                        outcome = FinalSaveQueueFullOutcome.SPOOL_UNAVAILABLE;
-                        detail = "queue full — spool is not initialized; final state may be lost";
-                    }
-                } catch (Exception spoolError) {
-                    outcome = FinalSaveQueueFullOutcome.SPOOL_FAILED;
-                    detail = "queue full — failed to spool final save: "
-                        + (spoolError.getMessage() != null ? spoolError.getMessage() : spoolError.getClass().getSimpleName());
-                    logger.log(Level.SEVERE, "[FinalSave] CRITICAL: failed to spool final save for "
-                        + uuid + ". Final state may be lost. Lock will expire naturally.", spoolError);
-                }
-                recordFinalSaveQueueFull("QUIT", uuid, detail, e, outcome);
+                String session = playerLockSessions.get(uuid);
+                FinalSaveStats.SpoolResult spoolResult =
+                    finalSaveStats.trySpoolFinalSave(uuid, data, SaveKind.QUIT, session);
+                finalSaveStats.recordQueueFull("QUIT", uuid, spoolResult.detail(), e, spoolResult.outcome());
                 pendingSaveCount.decrementAndGet();
                 // Do NOT release lock — replay will release it after CAS succeeds if spooled.
                 // If spool failed/unavailable, lock expires naturally.
@@ -1403,12 +1360,12 @@ public class SyncManager {
                 return;
             }
             // Fallback allowed: run synchronously on the event thread.
-            recordFinalSaveQueueFull(
+            finalSaveStats.recordQueueFull(
                 "QUIT", uuid,
                 "running synchronously on event thread as last-resort fallback. "
                     + "This blocks the game tick; investigate DB latency or raise "
                     + "final-save.queue-capacity.",
-                e, FinalSaveQueueFullOutcome.SYNC_FALLBACK);
+                e, FinalSaveStats.QueueFullOutcome.SYNC_FALLBACK);
             saveLock.lock();
             try {
                 refreshVersionAndFencingToken(uuid, data);
@@ -2498,11 +2455,11 @@ public class SyncManager {
                             // The final-save queue is full, but shutdown cannot
                             // skip saves. Log at SEVERE: this runs DB I/O on the
                             // entity/global thread and blocks the tick loop.
-                            recordFinalSaveQueueFull(
+                            finalSaveStats.recordQueueFull(
                                 "SHUTDOWN", uuid,
                                 "running synchronously on event thread as fallback. "
                                     + "Investigate DB latency or raise final-save.queue-capacity.",
-                                e, FinalSaveQueueFullOutcome.SYNC_FALLBACK);
+                                e, FinalSaveStats.QueueFullOutcome.SYNC_FALLBACK);
                             SaveResult result;
                             try {
                                 saveLock.lock();
@@ -3215,10 +3172,7 @@ public class SyncManager {
         }
 
         // Close operation log (file-based)
-        if (operationLogManager != null) {
-            operationLogManager.close();
-            operationLogManager = null;
-        }
+        operationLogDelegate.close();
 
         // Shut down thread pool
         if (asyncExecutor != null) {
@@ -3504,7 +3458,7 @@ public class SyncManager {
             }
 
             long serElapsed = (System.nanoTime() - startSer) / 1_000_000;
-            if (serializeLatency != null) serializeLatency.record(serElapsed);
+            latencyMonitor.recordSerialize(serElapsed);
 
             // Single-transaction component upsert with fencing validation. The
             // cursor hot path conditionally advances the metadata row first,
@@ -3537,7 +3491,7 @@ public class SyncManager {
                     playerLockSessions.get(uuid), data.getVersion(), dirtyBits);
             }
             long dbElapsed = (System.nanoTime() - dbStart) / 1_000_000;
-            if (saveLatency != null) saveLatency.record(dbElapsed);
+            latencyMonitor.recordSave(dbElapsed);
 
             if (!batchResult.success()) {
                 // P0 (round 15): classify the rejection. Previously every
@@ -3901,7 +3855,7 @@ public class SyncManager {
             long checksum = encoded.checksum();
 
             long serElapsedMs = (System.nanoTime() - startTime) / 1_000_000;
-            if (serializeLatency != null) serializeLatency.record(serElapsedMs);
+            latencyMonitor.recordSerialize(serElapsedMs);
 
             if (config.isLogTiming()) {
                 logger.info("[Timing] Serialize " + kind + " for " + uuid + ": " + serElapsedMs + "ms"
@@ -4002,7 +3956,7 @@ public class SyncManager {
             }
 
             long saveElapsedMs = (System.nanoTime() - saveStart) / 1_000_000;
-            if (saveLatency != null) saveLatency.record(saveElapsedMs);
+            latencyMonitor.recordSave(saveElapsedMs);
 
             if (!saved) {
                 // Genuine conflict (external fencing violation, lock lost, or
@@ -4014,11 +3968,11 @@ public class SyncManager {
                     ", locked_by=" + actualLockedBy + ", session=" + actualSession + ")"
                     + (attempt > 1 ? " [after " + attempt + " attempts]" : ""));
 
-                logOperation(uuid, OperationType.CONFLICT, fencingToken, expectedVersion,
+                operationLogDelegate.logOperation(uuid, OperationType.CONFLICT, fencingToken, expectedVersion,
                     compressed.length, kind + " conflict: expected v" + expectedVersion + "/ft" + fencingToken +
                     ", actual v" + actualVersion + "/ft" + actualFencingToken);
 
-                if (saveLatency != null) saveLatency.recordError();
+                latencyMonitor.recordSaveError();
 
                 if (kind.releaseLock) {
                     // P0 (round 11): final save CAS conflict — DO NOT release
@@ -4113,7 +4067,7 @@ public class SyncManager {
                     }
                 }
 
-                logOperation(uuid, OperationType.SAVE, fencingToken, expectedVersion + 1,
+                operationLogDelegate.logOperation(uuid, OperationType.SAVE, fencingToken, expectedVersion + 1,
                     compressed.length, kind + " saved v" + (expectedVersion + 1) + " cause=" + data.getSaveCause());
 
                 if (kind.releaseLock) {
@@ -4385,64 +4339,60 @@ public class SyncManager {
     }
 
     public long getFinalSaveQueueFullTotal() {
-        return finalSaveQueueFullTotal.get();
+        return finalSaveStats.getQueueFullTotal();
     }
 
     public long getFinalSaveLastQueueFullAt() {
-        return finalSaveLastQueueFullAt.get();
+        return finalSaveStats.getLastQueueFullAt();
     }
 
     public long getFinalSaveSpoolEnqueuedTotal() {
-        return finalSaveSpoolEnqueuedTotal.get();
+        return finalSaveStats.getSpoolEnqueuedTotal();
     }
 
     public long getFinalSaveLastSpoolEnqueuedAt() {
-        return finalSaveLastSpoolEnqueuedAt.get();
+        return finalSaveStats.getLastSpoolEnqueuedAt();
     }
 
     public long getFinalSaveSpoolRejectedTotal() {
-        return finalSaveSpoolRejectedTotal.get();
+        return finalSaveStats.getSpoolRejectedTotal();
     }
 
     public long getFinalSaveLastSpoolRejectedAt() {
-        return finalSaveLastSpoolRejectedAt.get();
+        return finalSaveStats.getLastSpoolRejectedAt();
     }
 
     public long getFinalSaveSyncFallbackTotal() {
-        return finalSaveSyncFallbackTotal.get();
+        return finalSaveStats.getSyncFallbackTotal();
     }
 
     public long getFinalSaveLastSyncFallbackAt() {
-        return finalSaveLastSyncFallbackAt.get();
+        return finalSaveStats.getLastSyncFallbackAt();
     }
 
     public boolean hasFinalSaveAlert() {
-        return finalSaveSyncFallbackTotal.get() > 0
-            || finalSaveSpoolRejectedTotal.get() > 0
-            || getFinalSaveSpoolFailedCount() > 0;
+        return finalSaveStats.hasAlert();
     }
 
     public boolean hasFinalSaveWarning() {
-        return finalSaveQueueFullTotal.get() > 0
-            || finalSaveSpoolEnqueuedTotal.get() > 0
-            || getFinalSaveSpoolPendingCount() > 0;
+        return finalSaveStats.hasWarning();
     }
 
     // Final-save spool telemetry
     public long getFinalSaveSpoolPendingCount() {
-        return finalSaveSpool != null ? finalSaveSpool.getPendingCount() : 0;
+        return finalSaveStats.getSpoolPendingCount();
     }
     public long getFinalSaveSpoolFailedCount() {
-        return finalSaveSpool != null ? finalSaveSpool.getFailedCount() : 0;
+        return finalSaveStats.getSpoolFailedCount();
     }
     public long getFinalSaveSpoolBytes() {
-        return finalSaveSpool != null ? finalSaveSpool.getTotalBytes() : 0;
+        return finalSaveStats.getSpoolBytes();
     }
     public long getFinalSaveSpoolLastReplayAt() {
-        return finalSaveSpool != null ? finalSaveSpool.getLastReplayAt() : 0;
+        return finalSaveStats.getSpoolLastReplayAt();
     }
     public String getFinalSaveSpoolLastError() {
-        return finalSaveSpool != null ? finalSaveSpool.getLastError() : null;
+        return finalSaveStats.getSpoolLastError();
     }
 
     /**
@@ -4462,94 +4412,40 @@ public class SyncManager {
         }
         SaveResult result = persistCollectedData(uuid, data, kind, preSaveSnapshot);
         if (result.isRetryable()) {
-            spoolRetryableFinalSave(
+            finalSaveStats.spoolRetryableFinalSave(
                 uuid, data, kind, result, playerLockSessions.get(uuid), detail);
         }
         return result;
     }
 
     /**
-     * Spool a failed final save for later replay.
-     *
-     * <p>Only retryable failures ({@link SaveResult#isRetryable()}) are spooled.
-     * Non-retryable failures (FENCING_MISMATCH, VERSION_CONFLICT) are NOT spooled
-     * — the lock is lost and replaying the save would clobber newer data.
-     *
-     * @param uuid the player UUID
-     * @param data the player data that failed to save
-     * @param kind the save kind (typically QUIT)
-     * @param result the failed save result
-     * @param lockSessionId the lock session ID
-     * @param detail a human-readable description of the failure
-     * @return true if the save was spooled, false if it was not retryable or spooling failed
+     * Spool a failed final save for later replay. Delegates to
+     * {@link FinalSaveStats#spoolRetryableFinalSave}.
      */
     public boolean spoolRetryableFinalSave(
             UUID uuid, PlayerData data, SaveKind kind,
             SaveResult result, String lockSessionId, String detail) {
-        if (!result.isRetryable()) {
-            return false;
-        }
-        if (finalSaveSpool == null) {
-            logger.warning("[FinalSave] Cannot spool retryable save for " + uuid
-                + " — spool is not initialized: " + detail);
-            return false;
-        }
-        try {
-            com.fastsync.spool.EncodedFinalSave encoded = com.fastsync.spool.FinalSaveEncoder.encode(
-                uuid, data, kind,
-                config.getClusterId(), config.getServerName(),
-                lockSessionId, config.getCompressionMinSize());
-            finalSaveSpool.append(encoded);
-            finalSaveSpoolEnqueuedTotal.incrementAndGet();
-            finalSaveLastSpoolEnqueuedAt.set(System.currentTimeMillis());
-            logger.info("[FinalSave] Spooled retryable " + kind + " save for " + uuid
-                + " (" + result.failureReason() + "): " + detail);
-            return true;
-        } catch (Exception e) {
-            finalSaveSpoolRejectedTotal.incrementAndGet();
-            finalSaveLastSpoolRejectedAt.set(System.currentTimeMillis());
-            logger.log(Level.SEVERE, "[FinalSave] CRITICAL: failed to spool retryable save for "
-                + uuid + ". Final state may be lost. Lock will expire naturally.", e);
-            return false;
-        }
+        return finalSaveStats.spoolRetryableFinalSave(uuid, data, kind, result, lockSessionId, detail);
     }
 
     public boolean isOperationLogEnabled() {
-        return operationLogManager != null && operationLogManager.isEnabled();
+        return operationLogDelegate.isEnabled();
     }
 
     public int getOperationLogQueueSize() {
-        return operationLogManager != null ? operationLogManager.getQueueSize() : -1;
+        return operationLogDelegate.getQueueSize();
     }
 
     public int getOperationLogQueueCapacity() {
-        return operationLogManager != null ? operationLogManager.getQueueCapacity() : -1;
+        return operationLogDelegate.getQueueCapacity();
     }
 
     public long getOperationLogDroppedTotal() {
-        return operationLogManager != null ? operationLogManager.getDroppedCount() : 0L;
+        return operationLogDelegate.getDroppedTotal();
     }
 
     public long getOperationLogLastDropAt() {
-        return operationLogManager != null ? operationLogManager.getLastDropTimestamp() : 0L;
-    }
-
-    /**
-     * Log an operation to the per-UUID operation log (Raft-inspired).
-     * Non-blocking — logging never blocks the main save/load path.
-     */
-    private void logOperation(UUID uuid, OperationType type, long fencingToken,
-                              long version, int dataSize, String detail) {
-        if (operationLogManager != null) {
-            OperationLog log = OperationLog.create(uuid, type, config.getServerName(),
-                fencingToken, version, dataSize, detail);
-            operationLogManager.append(log)
-                .thenRun(() -> operationLogManager.prune(uuid, config.getOperationLogRetention()))
-                .exceptionally(e -> {
-                    logger.log(Level.WARNING, "[OpLog] Failed to log " + type + " for " + uuid, e);
-                    return null;
-                });
-        }
+        return operationLogDelegate.getLastDropAt();
     }
 
     static void verifyComponentOverlayCompleteness(
@@ -4581,60 +4477,11 @@ public class SyncManager {
         return names;
     }
 
-    private enum FinalSaveQueueFullOutcome {
-        SPOOLED, SPOOL_UNAVAILABLE, SPOOL_FAILED, SYNC_FALLBACK
-    }
-
-    private void recordFinalSaveQueueFull(
-            String kind, UUID uuid, String detail,
-            java.util.concurrent.RejectedExecutionException cause,
-            FinalSaveQueueFullOutcome outcome) {
-        long now = System.currentTimeMillis();
-        long queueFullCount = finalSaveQueueFullTotal.incrementAndGet();
-        finalSaveLastQueueFullAt.set(now);
-        long spooled = finalSaveSpoolEnqueuedTotal.get();
-        long spoolRejected = finalSaveSpoolRejectedTotal.get();
-        long syncFallback = finalSaveSyncFallbackTotal.get();
-        switch (outcome) {
-            case SPOOLED -> {
-                spooled = finalSaveSpoolEnqueuedTotal.incrementAndGet();
-                finalSaveLastSpoolEnqueuedAt.set(now);
-            }
-            case SPOOL_UNAVAILABLE, SPOOL_FAILED -> {
-                spoolRejected = finalSaveSpoolRejectedTotal.incrementAndGet();
-                finalSaveLastSpoolRejectedAt.set(now);
-            }
-            case SYNC_FALLBACK -> {
-                syncFallback = finalSaveSyncFallbackTotal.incrementAndGet();
-                finalSaveLastSyncFallbackAt.set(now);
-            }
-        }
-        Level level = switch (outcome) {
-            case SPOOLED -> Level.WARNING;
-            case SPOOL_UNAVAILABLE, SPOOL_FAILED, SYNC_FALLBACK -> Level.SEVERE;
-        };
-        logger.log(level, "[FinalSave] Final-save executor rejected " + kind + " save for "
-            + uuid + " — " + detail
-            + " (outcome=" + outcome
-            + ", queueFullTotal=" + queueFullCount
-            + ", spooledTotal=" + spooled
-            + ", spoolRejectedTotal=" + spoolRejected
-            + ", syncFallbackTotal=" + syncFallback + ")", cause);
-    }
-
     /**
      * Query the operation history for a player.
      */
     public List<OperationLog> queryOperationLog(UUID uuid, int limit) {
-        if (operationLogManager == null) {
-            return List.of();
-        }
-        try {
-            return operationLogManager.queryHistory(uuid, limit);
-        } catch (Exception e) {
-            logger.log(Level.WARNING, "Failed to query operation log for " + uuid, e);
-            return List.of();
-        }
+        return operationLogDelegate.queryHistory(uuid, limit);
     }
 
     // ==================== Redis Streams (critical events) ====================
@@ -4706,20 +4553,14 @@ public class SyncManager {
      * Call periodically or on shutdown to monitor tail latency.
      */
     public void logLatencyStats() {
-        if (loadLatency != null) loadLatency.logStats();
-        if (saveLatency != null) saveLatency.logStats();
-        if (serializeLatency != null) serializeLatency.logStats();
+        latencyMonitor.logStats();
     }
 
     /**
      * Return latency status lines for /fastsync status display.
      */
     public java.util.List<String> getLatencyStatusLines() {
-        java.util.List<String> lines = new java.util.ArrayList<>();
-        if (loadLatency != null) lines.add(loadLatency.getStatusLine());
-        if (saveLatency != null) lines.add(saveLatency.getStatusLine());
-        if (serializeLatency != null) lines.add(serializeLatency.getStatusLine());
-        return lines;
+        return latencyMonitor.getStatusLines();
     }
 
     /**
