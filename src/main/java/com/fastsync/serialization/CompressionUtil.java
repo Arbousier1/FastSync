@@ -272,9 +272,8 @@ public class CompressionUtil {
 
             if (algoBits == FLAG_ALGORITHM_ZSTD) {
                 try {
-                    int decompressed = Zstd.decompress(restored, wrappedData,
-                        6, wrappedData.length - 6, originalLength);
-                    if (decompressed != originalLength) {
+                    long decompressed = Zstd.decompress(restored, wrappedData, 6, wrappedData.length - 6);
+                    if ((int) decompressed != originalLength) {
                         throw new CorruptDataException(
                             "ZSTD decompression size mismatch (expected=" + originalLength
                                 + ", actual=" + decompressed + ")");

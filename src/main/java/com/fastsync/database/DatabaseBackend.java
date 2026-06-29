@@ -118,10 +118,9 @@ public interface DatabaseBackend {
      * @param playersToRefresh map of UUID → fencing token
      * @param serverName       the server holding the locks
      * @param lockSessionId    the lock session ID
-     * @return map of UUID → true/false (refreshed/failed)
      * @throws SQLException on database error
      */
-    Map<UUID, Boolean> refreshLockBatch(Map<UUID, Long> playersToRefresh,
+    void refreshLockBatch(Map<UUID, Long> playersToRefresh,
         String serverName, String lockSessionId) throws SQLException;
 
     /**

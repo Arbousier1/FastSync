@@ -260,26 +260,27 @@ public class ConfigManager {
     private void migrateConfig(YamlDocument doc, int fromVersion, File configFile) {
         plugin.getLogger().info("[Config] Migrating config from v" + fromVersion
             + " to v" + CURRENT_CONFIG_VERSION);
+        SparrowConfigSource src = new SparrowConfigSource(doc);
 
         // v1 → v2: Added config_version, language, zstd-level, compression type update
         if (fromVersion < 2) {
             // Ensure language key exists
-            if (doc.get("language") == null) {
-                doc.set("language", "en");
+            if (src.getString("language", "").isEmpty()) {
+                doc.set("en", (Object) new String[]{"language"});
             }
             // Ensure compression.zstd-level exists
-            if (doc.get("compression.zstd-level") == null) {
-                doc.set("compression.zstd-level", 3);
+            if (src.getInt("compression.zstd-level", -1) == -1) {
+                doc.set(3, (Object) new Object[]{"compression", "zstd-level"});
             }
-            // Update compression type comment if it still says "only LZ4"
-            String compType = doc.getString("compression.type", "LZ4");
-            if (compType == null || compType.isBlank()) {
-                doc.set("compression.type", "LZ4");
+            // Ensure compression.type has a value
+            String compType = src.getString("compression.type", "");
+            if (compType.isEmpty()) {
+                doc.set("LZ4", (Object) new String[]{"compression", "type"});
             }
         }
 
         // Update config version
-        doc.set("config_version", CURRENT_CONFIG_VERSION);
+        doc.set(CURRENT_CONFIG_VERSION, (Object) new String[]{"config_version"});
 
         // Save migrated config
         try {
